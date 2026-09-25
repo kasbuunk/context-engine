@@ -1,0 +1,9 @@
+{
+	"//": "Claude policy for the `context-engine` container profile. The mountless container IS the boundary: no host FS, no host socket, no [[env]] secret, egress fully open on purpose. So Claude's own sandbox is off and bypassPermissions is the default (yolo-in-a-box). Flip defaultMode to \"default\" if you ever add secrets to context-engine.toml. Projected root:root 0444 => immutable to the `dev` session.",
+	"permissions": {
+		"defaultMode": "bypassPermissions"
+	},
+	"sandbox": {
+		"enabled": false
+	}
+}

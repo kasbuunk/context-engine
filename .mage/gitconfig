@@ -1,0 +1,25 @@
+# Projected by `mage context-engine` ([[file]] -> /home/dev/.gitconfig, root:root 0444).
+# Edit here and re-run `mage context-engine` to re-project.
+#   1. user.{name,email}: commit identity inside the container.
+#   2. credential.helper: feeds $GITHUB_TOKEN (resolved per run from 1Password,
+#      never on disk) to github.com over HTTPS. Only active once the [[env]]
+#      GITHUB_TOKEN block in context-engine.toml is uncommented; until then the
+#      public repo still clones read-only.
+#   3. SSH is not used: the container has no key, and a projected key would land
+#      root:root 0444, which ssh rejects.
+[user]
+	name = Kas Buunk
+	email = kasbuunk@icloud.com
+
+# Scoped to github.com ONLY — an unscoped helper hands the PAT to any host that
+# answers 401, and egress here is fully open.
+[credential "https://github.com"]
+	helper = "!f(){ test -n \"$GITHUB_TOKEN\" || exit 0; echo username=x-access-token; echo password=$GITHUB_TOKEN; };f"
+
+# The repo's origin is an SSH URL on the host; rewrite so clones/pushes inside
+# the box go over HTTPS where the helper above fires.
+[url "https://github.com/"]
+	insteadOf = git@github.com:
+
+[init]
+	defaultBranch = main

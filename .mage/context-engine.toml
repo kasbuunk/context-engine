@@ -1,0 +1,72 @@
+# context-engine — yolo dev box for this repo.
+#
+# WHY THIS SHAPE
+#   `container` host = mountless + filesystem-isolated: nothing inside can see or
+#   rewrite the Mac's files (mage never mounts; code moves over git). Omitting
+#   [network] leaves egress FULLY OPEN, so pip/uv/npm/gh/claude.ai all just work.
+#   Claude runs in bypassPermissions (managed-settings.json) because the box IS
+#   the boundary: no host FS, no host socket, no secrets by default.
+#
+#   Persistent + shared so the toolchain and /work/context-engine survive across
+#   sessions. The container `mage-context-engine` is created ONCE, out-of-band,
+#   by ./provision.sh (mage attaches, never creates). Ports published there:
+#   127.0.0.1:8000 and 127.0.0.1:5173.
+#
+# USE (from the repo root, where ./.mage/ resolves):
+#   .mage/provision.sh                 # one-time (destroys + recreates the box)
+#   mage context-engine --print        # inspect the resolved profile
+#   mage context-engine                # zsh login shell in /work/context-engine
+#   mage context-engine -- claude      # straight into Claude, no prompts
+#   First run: `claude` then /login (OAuth over the open network).
+#
+# TEARDOWN:  docker rm -f mage-context-engine
+
+[host]
+type    = "container"
+image   = "debian:bookworm-slim"
+name    = "mage-context-engine"
+user    = "dev"
+workdir = "/work/context-engine"
+shell   = "/usr/bin/zsh"
+
+[isolation]
+sharing     = "shared"
+persistence = "persistent"
+
+# PUSH ACCESS (opt-in). The repo is public, so clone/pull needs nothing. To push
+# from inside, create a FINE-GRAINED PAT scoped to kasbuunk/context-engine only
+# (Contents: read/write), store it in 1Password, then uncomment. A dangling op
+# reference aborts every run, so `op read` it first. Adding it puts a real secret
+# in a box with open egress + bypassPermissions — the scope is the mitigation.
+# [[env]]
+# name = "GITHUB_TOKEN"
+# op   = "op://Employee/github-context-engine/credential"
+
+# Claude policy: sandbox off, bypassPermissions. root:root 0444 => immutable.
+[[file]]
+path = "/etc/claude-code/managed-settings.json"
+mode = "0444"
+file = "/Users/kbuunk/git/github.com/kasbuunk/context-engine/.mage/managed-settings.json"
+
+# User-level Claude prefs shared with the other mage profiles.
+[[file]]
+path = "/home/dev/.claude/settings.json"
+mode = "0444"
+file = "/Users/kbuunk/.config/mage/claude/vm-user-settings.json"
+
+# Git identity + github.com-scoped $GITHUB_TOKEN helper + ssh->https rewrite.
+[[file]]
+path = "/home/dev/.gitconfig"
+mode = "0444"
+file = "/Users/kbuunk/git/github.com/kasbuunk/context-engine/.mage/gitconfig"
+
+# Shell + tmux config shared with devbox/rust.
+[[file]]
+path = "/home/dev/.zshrc"
+mode = "0444"
+file = "/Users/kbuunk/.config/mage/ns-auto-vm-zshrc"
+
+[[file]]
+path = "/home/dev/.tmux.conf"
+mode = "0444"
+file = "/Users/kbuunk/.config/mage/devbox-tmux.conf"
