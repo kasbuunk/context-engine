@@ -1,0 +1,458 @@
+#!/usr/bin/env python3
+"""ce: reference CLI for the context engine (SPEC.md §5).
+
+Stdlib only. The schema lives in schema.sql next to this file; the database
+carries the norms (triggers, views), this file only keeps the invariants that
+SQL cannot express on its own (§4: hashing, blob atomicity, subject edges,
+single-transaction synthesis).
+
+Every command prints JSON lines on stdout. Errors go to stderr, exit code 1.
+"""
+
+import argparse
+import datetime
+import hashlib
+import json
+import os
+import sqlite3
+import sys
+import tempfile
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+SCHEMA = os.path.join(HERE, "schema.sql")
+
+REPEATABILITY = {"stable", "decaying", "volatile", "manual"}
+STATUSES = ("ok", "empty", "partial", "failed")
+
+
+class CEError(Exception):
+    pass
+
+
+# --- hashing (§2.4) ----------------------------------------------------------
+
+def canonical_json(obj):
+    """Sorted keys, no insignificant whitespace, UTF-8."""
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"),
+                      ensure_ascii=False).encode("utf-8")
+
+
+def sha256(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def now():
+    # Microseconds, not the schema default's milliseconds: two content-less
+    # retrievals in the same millisecond must still get distinct hashes.
+    return datetime.datetime.now(datetime.timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%S.%fZ")
+
+
+def ref_hash(spec_json, created_at):
+    return sha256(spec_json + created_at.encode("utf-8"))
+
+
+# --- store -------------------------------------------------------------------
+
+class Store:
+    def __init__(self, db_path):
+        self.db_path = os.path.abspath(db_path)
+        self.blob_root = os.path.join(os.path.dirname(self.db_path), "blobs")
+
+    def connect(self, must_exist=True):
+        if must_exist and not os.path.exists(self.db_path):
+            raise CEError(f"no database at {self.db_path}; run `ce init` first")
+        conn = sqlite3.connect(self.db_path, isolation_level=None)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys = ON")
+        return conn
+
+    def init(self):
+        conn = self.connect(must_exist=False)
+        exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='artifacts'"
+        ).fetchone()
+        if not exists:
+            with open(SCHEMA, encoding="utf-8") as f:
+                conn.executescript(f.read())
+        os.makedirs(self.blob_root, exist_ok=True)
+        return {"db": self.db_path, "blobs": self.blob_root,
+                "created": not exists}
+
+    def blob_file(self, h):
+        return os.path.join(self.blob_root, h[:2], h[2:])
+
+    def write_blob(self, h, data):
+        """Invariant 3: temp file, fsync, rename; before the row exists."""
+        dest = self.blob_file(h)
+        if os.path.exists(dest):
+            return dest
+        d = os.path.dirname(dest)
+        os.makedirs(d, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=d, prefix=".tmp-")
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(data)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, dest)
+        except BaseException:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+            raise
+        dfd = os.open(d, os.O_RDONLY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+        return dest
+
+    def resolve(self, conn, ref):
+        """Full hash, or a unique prefix of at least 4 hex chars."""
+        ref = ref.strip().lower()
+        if len(ref) == 64:
+            if conn.execute("SELECT 1 FROM artifacts WHERE hash=?",
+                            (ref,)).fetchone():
+                return ref
+            raise CEError(f"no artifact {ref}")
+        if len(ref) < 4:
+            raise CEError(f"hash prefix too short: {ref!r}")
+        rows = conn.execute("SELECT hash FROM artifacts WHERE hash LIKE ? || '%'",
+                            (ref,)).fetchall()
+        if len(rows) != 1:
+            raise CEError(f"{'ambiguous' if rows else 'no'} artifact {ref!r}")
+        return rows[0]["hash"]
+
+    # -- writes ---------------------------------------------------------------
+
+    def _insert(self, conn, h, kind, spec_json, payload, created_at, status):
+        """Insert unless the hash already exists. Returns True if inserted."""
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO artifacts"
+            " (hash, kind, spec, payload, blob_path, created_at, status)"
+            " VALUES (?, ?, ?, ?, NULL, ?, ?)",
+            (h, kind, spec_json.decode("utf-8"), payload, created_at, status))
+        return cur.rowcount == 1
+
+    def ingest_text(self, spec, text, status):
+        spec_json = canonical_json(spec)
+        h = sha256(text.encode("utf-8"))
+        conn = self.connect()
+        created = self._insert(conn, h, "source", spec_json, text, now(), status)
+        return {"hash": h, "created": created}
+
+    def ingest_blob(self, spec, data, status):
+        spec_json = canonical_json(spec)
+        h = sha256(data)
+        conn = self.connect()
+        self.write_blob(h, data)
+        created = self._insert(conn, h, "source", spec_json, None, now(), status)
+        return {"hash": h, "created": created, "blob": self.blob_file(h)}
+
+    def ingest_ref(self, spec, status):
+        spec_json = canonical_json(spec)
+        conn = self.connect()
+        while True:  # a new created_at on the (unlikely) same-microsecond clash
+            created_at = now()
+            h = ref_hash(spec_json, created_at)
+            if self._insert(conn, h, "source", spec_json, None, created_at,
+                            status):
+                return {"hash": h, "created": True}
+
+    def synth(self, spec, text, subjects, contexts, supersedes):
+        if not subjects:
+            raise CEError("a synthesis needs at least one --subject (§4.5)")
+        spec_json = canonical_json(spec)
+        h = sha256(text.encode("utf-8"))
+        conn = self.connect()
+        subjects = [self.resolve(conn, s) for s in subjects]
+        contexts = [self.resolve(conn, c) for c in contexts]
+        supersedes = [self.resolve(conn, s) for s in supersedes]
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            if not self._insert(conn, h, "synthesis", spec_json, text, now(),
+                                "ok"):
+                # §8 open question: content-only identity. The existing claim
+                # keeps its own footnotes; we do not graft new ones onto it.
+                conn.execute("ROLLBACK")
+                print(f"ce: identical content already stored as {h}; "
+                      "no new edges added", file=sys.stderr)
+                return {"hash": h, "created": False}
+            edges = ([(t, "subject") for t in subjects]
+                     + [(t, "context") for t in contexts]
+                     + [(t, "supersedes") for t in supersedes])
+            for target, role in edges:
+                if target == h:
+                    raise CEError("a synthesis cannot reference itself")
+                if role == "supersedes":
+                    self._check_supersede_cycle(conn, h, target)
+                conn.execute("INSERT OR IGNORE INTO edges VALUES (?, ?, ?)",
+                             (h, target, role))
+            conn.execute("COMMIT")
+        except BaseException:
+            conn.execute("ROLLBACK")
+            raise
+        return {"hash": h, "created": True}
+
+    def _check_supersede_cycle(self, conn, new, old):
+        cyc = conn.execute(
+            """WITH RECURSIVE chain(hash) AS (
+                 SELECT ? UNION
+                 SELECT e.to_hash FROM edges e JOIN chain c ON e.from_hash = c.hash
+                 WHERE e.role = 'supersedes')
+               SELECT 1 FROM chain WHERE hash = ?""", (old, new)).fetchone()
+        if cyc:
+            raise CEError(f"{old} already (transitively) supersedes {new}")
+
+    def supersede(self, new, old):
+        conn = self.connect()
+        new, old = self.resolve(conn, new), self.resolve(conn, old)
+        if new == old:
+            raise CEError("an artifact cannot supersede itself")
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            self._check_supersede_cycle(conn, new, old)
+            cur = conn.execute("INSERT OR IGNORE INTO edges VALUES (?, ?, ?)",
+                               (new, old, "supersedes"))
+            conn.execute("COMMIT")
+        except BaseException:
+            conn.execute("ROLLBACK")
+            raise
+        return {"from": new, "to": old, "role": "supersedes",
+                "created": cur.rowcount == 1}
+
+    # -- reads ----------------------------------------------------------------
+
+    def _row(self, conn, r):
+        d = dict(r)
+        d["spec"] = json.loads(d["spec"])
+        d["current"] = not conn.execute(
+            "SELECT 1 FROM edges WHERE to_hash=? AND role='supersedes'",
+            (d["hash"],)).fetchone()
+        if d["payload"] is None and d.get("blob_path") is None:
+            f = self.blob_file(d["hash"])
+            if os.path.exists(f):
+                d["blob_file"] = f
+        elif d.get("blob_path"):
+            d["blob_file"] = d["blob_path"]
+        return d
+
+    def _brief(self, conn, h):
+        r = conn.execute("SELECT hash, kind, spec, status, created_at "
+                         "FROM artifacts WHERE hash=?", (h,)).fetchone()
+        spec = json.loads(r["spec"])
+        current = not conn.execute(
+            "SELECT 1 FROM edges WHERE to_hash=? AND role='supersedes'",
+            (h,)).fetchone()
+        return {"kind": r["kind"], "type": spec.get("type"),
+                "repeatability": spec.get("repeatability"),
+                "status": r["status"], "current": current}
+
+    # The §3 walks, extended with the parent each row was reached from so a
+    # chain can be printed as a tree. UNION on (hash, parent, via, depth).
+    WALK = {
+        "up": """WITH RECURSIVE up(hash, parent, via, depth) AS (
+                   SELECT :hash, NULL, NULL, 0
+                   UNION
+                   SELECT e.to_hash, u.hash, e.role, u.depth + 1
+                   FROM edges e JOIN up u ON e.from_hash = u.hash
+                   WHERE e.role IN ('subject','context'))
+                 SELECT * FROM up ORDER BY depth, via, hash""",
+        "down": """WITH RECURSIVE down(hash, parent, via, depth) AS (
+                   SELECT :hash, NULL, NULL, 0
+                   UNION
+                   SELECT e.from_hash, d.hash, e.role, d.depth + 1
+                   FROM edges e JOIN down d ON e.to_hash = d.hash
+                   WHERE e.role IN ('subject','context'))
+                 SELECT * FROM down ORDER BY depth, via, hash""",
+    }
+
+    def walk(self, direction, ref, conn=None):
+        conn = conn or self.connect()
+        h = self.resolve(conn, ref)
+        out = []
+        for r in conn.execute(self.WALK[direction], {"hash": h}):
+            d = dict(r)
+            d.update(self._brief(conn, d["hash"]))
+            out.append(d)
+        return out
+
+    def show(self, ref):
+        conn = self.connect()
+        h = self.resolve(conn, ref)
+        d = self._row(conn, conn.execute(
+            "SELECT * FROM artifacts WHERE hash=?", (h,)).fetchone())
+        d["edges_out"] = [dict(r) for r in conn.execute(
+            "SELECT to_hash AS hash, role FROM edges WHERE from_hash=? "
+            "ORDER BY role, to_hash", (h,))]
+        d["edges_in"] = [dict(r) for r in conn.execute(
+            "SELECT from_hash AS hash, role FROM edges WHERE to_hash=? "
+            "ORDER BY role, from_hash", (h,))]
+        d["footnotes"] = self.walk("up", h, conn)[1:]
+        return d
+
+    def search(self, query):
+        conn = self.connect()
+        try:
+            rows = conn.execute(
+                """SELECT a.hash, a.kind, a.spec, a.status, a.created_at,
+                          snippet(artifacts_fts, 0, '[', ']', '…', 12) AS snippet
+                   FROM artifacts_fts f
+                   JOIN artifacts a ON a.rowid = f.rowid
+                   JOIN current_artifacts c ON c.hash = a.hash
+                   WHERE artifacts_fts MATCH ?
+                   ORDER BY rank""", (query,)).fetchall()
+        except sqlite3.OperationalError as e:
+            raise CEError(f"bad search query: {e}")
+        return [dict(r, spec=json.loads(r["spec"])) for r in rows]
+
+    def stale(self):
+        conn = self.connect()
+        return [dict(r) for r in conn.execute(
+            "SELECT * FROM stale_syntheses ORDER BY synthesis, superseded_subject")]
+
+
+# --- CLI ---------------------------------------------------------------------
+
+def parse_spec(raw):
+    try:
+        spec = json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise CEError(f"--spec is not valid JSON: {e}")
+    if not isinstance(spec, dict):
+        raise CEError("--spec must be a JSON object")
+    if not isinstance(spec.get("type"), str) or not spec["type"]:
+        raise CEError("--spec needs a non-empty string 'type' (§2.2)")
+    if spec.get("repeatability") not in REPEATABILITY:
+        raise CEError("--spec needs 'repeatability', one of "
+                      + ", ".join(sorted(REPEATABILITY)) + " (§2.2)")
+    return spec
+
+
+def looks_binary(data):
+    if b"\x00" in data:
+        return True
+    try:
+        data.decode("utf-8")
+    except UnicodeDecodeError:
+        return True
+    return False
+
+
+def emit(obj):
+    print(json.dumps(obj, ensure_ascii=False, sort_keys=False))
+
+
+def cmd_init(store, a):
+    emit(store.init())
+
+
+def cmd_ingest(store, a):
+    modes = sum(bool(x) for x in (a.file, a.stdin, a.ref))
+    if modes != 1:
+        raise CEError("ingest takes exactly one of FILE, --stdin, --ref")
+    spec = parse_spec(a.spec)
+    if a.ref:
+        emit(store.ingest_ref(spec, a.status or "ok"))
+        return
+    if a.stdin:
+        data = sys.stdin.buffer.read()
+        if looks_binary(data):
+            raise CEError("--stdin takes UTF-8 text; ingest binaries as FILE")
+    else:
+        with open(a.file, "rb") as f:
+            data = f.read()
+        spec.setdefault("original_name", os.path.basename(a.file))
+    if not data:
+        # No content: hash spec||created_at so empty retrievals don't collide.
+        emit(store.ingest_ref(spec, a.status or "empty"))
+    elif a.binary or looks_binary(data):
+        emit(store.ingest_blob(spec, data, a.status or "ok"))
+    else:
+        emit(store.ingest_text(spec, data.decode("utf-8"), a.status or "ok"))
+
+
+def cmd_synth(store, a):
+    spec = parse_spec(a.spec)
+    data = sys.stdin.buffer.read()
+    if not data or looks_binary(data):
+        raise CEError("synth reads its payload as non-empty UTF-8 text on stdin")
+    emit(store.synth(spec, data.decode("utf-8"), a.subject or [],
+                     a.context or [], [a.supersedes] if a.supersedes else []))
+
+
+def cmd_supersede(store, a):
+    emit(store.supersede(a.new, a.old))
+
+
+def cmd_show(store, a):
+    emit(store.show(a.hash))
+
+
+def cmd_walk(store, a):
+    for r in store.walk(a.cmd, a.hash):
+        emit(r)
+
+
+def cmd_search(store, a):
+    for r in store.search(a.query):
+        emit(r)
+
+
+def cmd_stale(store, a):
+    for r in store.stale():
+        emit(r)
+
+
+def main(argv=None):
+    db_help = "database path (env CE_DB, default ./ce.db); blobs/ sits next to it"
+    p = argparse.ArgumentParser(prog="ce")
+    p.add_argument("--db", default=os.environ.get("CE_DB", "ce.db"), help=db_help)
+    # Also accept --db after the subcommand without clobbering one given before.
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--db", default=argparse.SUPPRESS, help=db_help)
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("init", parents=[common]); s.set_defaults(fn=cmd_init)
+
+    s = sub.add_parser("ingest", parents=[common])
+    s.add_argument("file", nargs="?")
+    s.add_argument("--stdin", action="store_true")
+    s.add_argument("--ref", action="store_true")
+    s.add_argument("--spec", required=True)
+    s.add_argument("--status", choices=STATUSES)
+    s.add_argument("--binary", action="store_true",
+                   help="force FILE into a blob even if it decodes as text")
+    s.set_defaults(fn=cmd_ingest)
+
+    s = sub.add_parser("synth", parents=[common])
+    s.add_argument("--spec", required=True)
+    s.add_argument("--subject", nargs="+", action="extend")
+    s.add_argument("--context", nargs="+", action="extend")
+    s.add_argument("--supersedes")
+    s.set_defaults(fn=cmd_synth)
+
+    s = sub.add_parser("supersede", parents=[common])
+    s.add_argument("new"); s.add_argument("old")
+    s.set_defaults(fn=cmd_supersede)
+
+    for name, fn in (("show", cmd_show), ("up", cmd_walk), ("down", cmd_walk)):
+        s = sub.add_parser(name, parents=[common])
+        s.add_argument("hash"); s.set_defaults(fn=fn)
+
+    s = sub.add_parser("search", parents=[common])
+    s.add_argument("query"); s.set_defaults(fn=cmd_search)
+
+    s = sub.add_parser("stale", parents=[common]); s.set_defaults(fn=cmd_stale)
+
+    a = p.parse_args(argv)
+    try:
+        a.fn(Store(a.db), a)
+    except (CEError, sqlite3.Error, OSError) as e:
+        print(f"ce: {e}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
