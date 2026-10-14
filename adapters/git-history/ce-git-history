@@ -1,0 +1,252 @@
+#!/usr/bin/env python3
+"""Feed a Git repository's file history into a context engine.
+
+An adapter, not part of the store: it only calls the `ce` CLI and reads the
+database to stay idempotent. Python stdlib only; delete this directory and
+`ce` is unaffected.
+
+Every committed version of every matched file becomes an artifact, and each
+version supersedes the one before it. A file whose YAML frontmatter names
+other files under a --link-key becomes a *synthesis* with a `subject` edge to
+the version of each linked file that was current at the same commit. Files
+without links are *sources*.
+
+Two kinds of link target are not a committed version, and both are stored as
+content-less evidence (`ce ingest --ref`) rather than skipped:
+
+  * a path that is not tracked in the repo (say, an audio file kept outside
+    Git) becomes `{type: external-file, path}`;
+  * a tracked file that had no committed version yet at the linking commit
+    becomes `{type: git-file-uncommitted, path}` with status `failed`. Its
+    first committed version supersedes it, so `ce stale` flags every claim
+    that was built on a version nobody can retrieve any more.
+
+Encrypted repos (git-crypt) work: content is read with `git show --textconv`.
+
+Usage:
+  ce-git-history --repo DIR [--name NAME] [--link-key KEY ...] -- PATHSPEC...
+"""
+
+import argparse
+import fnmatch
+import json
+import os
+import re
+import sqlite3
+import subprocess
+import sys
+
+CE = os.environ.get("CE", "ce")
+
+
+def git(repo, *args):
+    return subprocess.run(
+        ["git", "-C", repo, *args], check=True, capture_output=True
+    ).stdout
+
+
+def ce(*args, stdin=None):
+    out = subprocess.run(
+        [CE, *args], input=stdin, check=True, capture_output=True
+    ).stdout
+    return json.loads(out.decode().strip().splitlines()[-1])
+
+
+# --- frontmatter -------------------------------------------------------------
+
+WIKILINK = re.compile(r"\[\[([^\]|#]+)")
+
+
+def frontmatter(text):
+    if not text.startswith("---\n"):
+        return ""
+    end = text.find("\n---", 4)
+    return text[4:end] if end != -1 else ""
+
+
+def link_values(text, keys):
+    """[(link, is_wikilink)] under any of `keys`: wikilinks, or bare paths."""
+    out, lines = [], frontmatter(text).splitlines()
+    for i, line in enumerate(lines):
+        m = re.match(r"^([A-Za-z0-9_-]+):\s*(.*)$", line)
+        if not m or m[1] not in keys:
+            continue
+        value = m[2]
+        for nxt in lines[i + 1 :]:  # block list: "  - item"
+            if not re.match(r"^\s+-\s", nxt):
+                break
+            value += "\n" + nxt
+        wl = WIKILINK.findall(value)
+        if wl:
+            out += [(w.strip(), True) for w in wl]
+            continue
+        value = value.strip()
+        # Commas separate items only inside a flow list: "a, b.md" is one path.
+        if value.startswith("[") and value.endswith("]"):
+            items = value[1:-1].split(",")
+        else:
+            items = value.split("\n")
+        for item in items:
+            item = item.strip().lstrip("-").strip().strip("\"'")
+            if item:
+                out.append((item, False))
+    return out
+
+
+# --- adapter -----------------------------------------------------------------
+
+
+class Adapter:
+    def __init__(self, repo, name, db, keys, pathspecs, rewrites=()):
+        self.repo, self.name, self.keys = repo, name, keys
+        self.rewrites = [r.split("=", 1) for r in rewrites]
+        self.db = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        # -z: without it git C-quotes any path with non-ASCII bytes.
+        self.tracked = set(
+            git(repo, "log", "--all", "--format=", "--name-only", "-z", "--", ".")
+            .decode()
+            .replace("\n", "\0")
+            .split("\0")
+        ) - {""}
+        self.by_stem = {}
+        for p in self.tracked:
+            self.by_stem.setdefault(os.path.splitext(os.path.basename(p))[0], []).append(p)
+        self.pathspecs = pathspecs
+        self.memo = {}  # (path, commit) -> hash
+        self.hist = {}  # path -> history
+        self.stats = {"versions": 0, "new": 0, "links": 0, "external": 0}
+
+    def matches(self, path):
+        return any(fnmatch.fnmatchcase(path, ps) for ps in self.pathspecs)
+
+    def history(self, path):
+        """[(commit, iso_time)] oldest first, for commits that touch `path`."""
+        if path not in self.hist:
+            out = git(self.repo, "log", "--reverse", "--format=%H %cI", "--", path)
+            self.hist[path] = [tuple(l.split(" ", 1)) for l in out.decode().splitlines()]
+        return self.hist[path]
+
+    def resolve(self, link, wiki, from_path):
+        """Repo path for a link, or None. Wikilinks resolve by note name, the
+        way Obsidian does; bare paths only by path."""
+        for old, new in self.rewrites:
+            if link.startswith(old):
+                link = new + link[len(old):]
+        if link in self.tracked:
+            return link, link
+        if wiki:
+            cands = self.by_stem.get(os.path.basename(link), [])
+            return link, (cands[0] if len(cands) == 1 else None)
+        rel = os.path.normpath(os.path.join(os.path.dirname(from_path), link))
+        if rel in self.tracked:
+            return link, rel
+        # Relative to some ancestor directory: accept a unique suffix match.
+        cands = [p for p in self.tracked if p.endswith("/" + link)]
+        return link, (cands[0] if len(cands) == 1 else None)
+
+    def lookup(self, kind, path):
+        row = self.db.execute(
+            "SELECT hash FROM artifacts WHERE json_extract(spec,'$.type')=? "
+            "AND json_extract(spec,'$.repo')=? AND json_extract(spec,'$.path')=? "
+            "ORDER BY created_at LIMIT 1",
+            (kind, self.name, path),
+        ).fetchone()
+        return row[0] if row else None
+
+    def ref(self, kind, path, status):
+        h = self.lookup(kind, path)
+        if h is None:
+            spec = {"type": kind, "repo": self.name, "path": path,
+                    "repeatability": "manual" if status == "failed" else "stable"}
+            h = ce("ingest", "--ref", "--status", status, "--spec", json.dumps(spec))["hash"]
+            self.stats["new"] += 1
+        return h
+
+    def version_at(self, path, commit):
+        """Hash of `path` as it stood at `commit` (ingesting it if needed)."""
+        out = git(self.repo, "log", "-1", "--format=%H", commit, "--", path).decode().strip()
+        if not out:
+            stand_in = self.ref("git-file-uncommitted", path, "failed")
+            hist = self.history(path)
+            if hist:  # order-independent: link it to the first real version now
+                first = self.ingest_version(path, hist[0][0])
+                if first and first != stand_in:
+                    ce("supersede", first, stand_in)
+            return stand_in
+        return self.ingest_version(path, out)
+
+    def ingest_version(self, path, commit):
+        key = (path, commit)
+        if key in self.memo:
+            return self.memo[key]
+        hist = self.history(path)
+        idx = [c for c, _ in hist].index(commit)
+        prev = self.ingest_version(path, hist[idx - 1][0]) if idx else None
+        try:
+            data = git(self.repo, "show", "--textconv", f"{commit}:{path}")
+        except subprocess.CalledProcessError:  # deleted at this commit
+            self.memo[key] = prev
+            return prev
+        text = data.decode("utf-8", errors="replace")
+        spec = {"type": "git-file", "repo": self.name, "commit": commit,
+                "committed_at": hist[idx][1], "path": path,
+                "repeatability": "stable"}
+
+        subjects = []
+        for link, wiki in link_values(text, self.keys):
+            link, target = self.resolve(link, wiki, path)
+            if target is None:
+                self.stats["external"] += 1
+                subjects.append(self.ref("external-file", link, "ok"))
+            elif target != path:
+                subjects.append(self.version_at(target, commit))
+        subjects = list(dict.fromkeys(subjects))
+        self.stats["links"] += len(subjects)
+
+        if not text.strip():
+            h = ce("ingest", "--ref", "--status", "empty", "--spec", json.dumps(spec))["hash"]
+        elif subjects:
+            args = ["synth", "--spec", json.dumps(spec), "--subject", *subjects]
+            if prev:
+                args += ["--supersedes", prev]
+            r = ce(*args, stdin=text.encode())
+            h = r["hash"]
+        else:
+            r = ce("ingest", "--stdin", "--spec", json.dumps(spec), stdin=text.encode())
+            h = r["hash"]
+            if prev and prev != h:
+                ce("supersede", h, prev)
+        if idx == 0:  # the first commit replaces any "not yet committed" stand-in
+            stand_in = self.lookup("git-file-uncommitted", path)
+            if stand_in and stand_in != h:
+                ce("supersede", h, stand_in)
+        self.stats["versions"] += 1
+        self.memo[key] = h
+        return h
+
+    def run(self):
+        paths = sorted(p for p in self.tracked if self.matches(p))
+        for p in paths:
+            for commit, _ in self.history(p):
+                self.ingest_version(p, commit)
+        return self.stats
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("--repo", required=True)
+    ap.add_argument("--name", help="repo identifier stored in spec (default: dir name)")
+    ap.add_argument("--db", default=os.environ.get("CE_DB", "ce.db"))
+    ap.add_argument("--link-key", action="append", default=[], dest="keys")
+    ap.add_argument("--rewrite", action="append", default=[], metavar="FROM=TO",
+                    help="rewrite a link prefix before resolving (path aliases)")
+    ap.add_argument("pathspec", nargs="+", help="fnmatch globs over repo paths")
+    a = ap.parse_args()
+    os.environ["CE_DB"] = a.db
+    name = a.name or os.path.basename(os.path.abspath(a.repo))
+    stats = Adapter(a.repo, name, a.db, set(a.keys), a.pathspec, a.rewrite).run()
+    print(json.dumps(stats))
+
+
+if __name__ == "__main__":
+    sys.exit(main())
