@@ -56,12 +56,9 @@ impl Env {
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();
-        child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(stdin.as_ref())
-            .unwrap();
+        // ce may reject its arguments and exit before reading stdin; the
+        // write then fails with a broken pipe, which is not the test's concern.
+        let _ = child.stdin.take().unwrap().write_all(stdin.as_ref());
         child.wait_with_output().unwrap()
     }
 
