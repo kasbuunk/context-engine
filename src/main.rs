@@ -103,6 +103,9 @@ impl Store {
     fn open(&self) -> Result<Connection> {
         let conn = Connection::open(&self.db_path)?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
+        // Several writers share a store (a scheduled ingest, agents saving
+        // syntheses): wait for the lock instead of failing at once.
+        conn.busy_timeout(std::time::Duration::from_secs(60))?;
         Ok(conn)
     }
 
