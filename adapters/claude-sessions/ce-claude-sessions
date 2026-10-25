@@ -1,0 +1,244 @@
+#!/usr/bin/env python3
+"""Feed Claude conversations into a context engine.
+
+Two kinds of input:
+
+  --claude-code DIR   Claude Code transcripts (*.jsonl), searched recursively.
+                      A session can appear more than once (a live copy and an
+                      older archive); the largest file per session id wins.
+                      Sub-agent transcripts (under .../subagents/) are skipped.
+  --claude-ai FILE    conversations.json from a claude.ai data export. Give
+                      several exports oldest first; a later export's version of
+                      a conversation supersedes an earlier one.
+
+Each session or conversation becomes one source artifact whose payload is a
+readable transcript: who said what, when, and one line per tool call. Tool
+results, thinking and harness-injected text are left out; they are noise for
+search and stay in the original file, which the spec points at.
+
+A session that has grown since the last run is stored again and supersedes its
+previous version (matched on session id / conversation uuid). Re-running with
+nothing new adds nothing.
+
+An adapter, not part of the store: it calls `ce` and reads the database only
+to find a session's current version. Python stdlib only; delete this
+directory and `ce` is unaffected.
+
+Usage:
+  ce-claude-sessions [--skip REGEX ...] [--claude-code DIR ...] [--claude-ai FILE ...]
+"""
+
+import argparse
+import json
+import os
+import re
+import sqlite3
+import subprocess
+import sys
+
+CE = os.environ.get("CE", "ce")
+RENDERER = "ce-claude-sessions/1"
+UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+INJECTED = re.compile(r"<(system-reminder|local-command-stdout|local-command-caveat)>.*?</\1>", re.S)
+
+
+def ts(s):
+    return (s or "")[:16].replace("T", " ")
+
+
+def one_line(s, n=200):
+    s = " ".join(str(s).split())
+    return s if len(s) <= n else s[: n - 1] + "…"
+
+
+def tool_line(block):
+    inp = block.get("input") or {}
+    if isinstance(inp, dict):
+        for key in ("command", "file_path", "pattern", "query", "url", "description", "prompt", "path"):
+            if inp.get(key):
+                return f"  → {block.get('name')}: {one_line(inp[key])}"
+        return f"  → {block.get('name')}: {one_line(json.dumps(inp, ensure_ascii=False))}"
+    return f"  → {block.get('name')}"
+
+
+# ---- Claude Code ---------------------------------------------------------
+
+
+def render_claude_code(path):
+    """Transcript text and metadata of one .jsonl, or None if it has no dialogue."""
+    lines, meta = [], {"cwd": None, "first": None, "last": None, "titles": []}
+    with open(path, encoding="utf-8", errors="replace") as f:
+        for raw in f:
+            try:
+                d = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            t = d.get("type")
+            if t == "summary" and d.get("summary"):
+                meta["titles"].append(d["summary"])
+            if t in ("ai-title", "custom-title") and (d.get("title") or d.get("aiTitle") or d.get("customTitle")):
+                meta["titles"].append(d.get("title") or d.get("aiTitle") or d.get("customTitle"))
+            if t not in ("user", "assistant") or d.get("isMeta") or d.get("isSidechain"):
+                continue
+            meta["cwd"] = meta["cwd"] or d.get("cwd")
+            stamp = d.get("timestamp")
+            meta["first"] = meta["first"] or stamp
+            meta["last"] = stamp or meta["last"]
+            who = "Kas" if t == "user" else "Claude"
+            content = (d.get("message") or {}).get("content")
+            blocks = [{"type": "text", "text": content}] if isinstance(content, str) else (content or [])
+            out = []
+            for b in blocks:
+                if not isinstance(b, dict):
+                    continue
+                if b.get("type") == "text":
+                    text = INJECTED.sub("", b.get("text") or "").strip()
+                    if text:
+                        out.append(text)
+                elif b.get("type") == "tool_use":
+                    out.append(tool_line(b))
+            if out:
+                lines.append(f"[{ts(stamp)}] {who}: " + "\n".join(out))
+    if not lines:
+        return None, meta
+    return lines, meta
+
+
+def claude_code_sessions(roots, skip):
+    """session id -> path of its largest transcript."""
+    best = {}
+    for root in roots:
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [d for d in dirnames if d != "subagents"]
+            for name in filenames:
+                if not name.endswith(".jsonl"):
+                    continue
+                path = os.path.join(dirpath, name)
+                if any(r.search(path) for r in skip):
+                    continue
+                ids = UUID.findall(name)
+                if not ids:
+                    continue
+                sid, size = ids[-1], os.path.getsize(path)
+                if sid not in best or size > best[sid][1]:
+                    best[sid] = (path, size)
+    return {sid: p for sid, (p, _) in best.items()}
+
+
+# ---- claude.ai -----------------------------------------------------------
+
+
+def render_claude_ai(conv):
+    lines = []
+    for m in conv.get("chat_messages") or []:
+        who = "Kas" if m.get("sender") == "human" else "Claude"
+        out = []
+        blocks = m.get("content") or [{"type": "text", "text": m.get("text")}]
+        for b in blocks:
+            if b.get("type") == "text" and (b.get("text") or "").strip():
+                out.append(b["text"].strip())
+            elif b.get("type") == "tool_use":
+                out.append(tool_line(b))
+        for a in m.get("attachments") or []:
+            if a.get("extracted_content"):
+                out.append(f"[attachment {a.get('file_name', '')}]\n{a['extracted_content'].strip()}")
+        for fl in m.get("files") or []:
+            if fl.get("file_name"):
+                out.append(f"[file {fl['file_name']}]")
+        if out:
+            lines.append(f"[{ts(m.get('created_at'))}] {who}: " + "\n".join(out))
+    return lines
+
+
+# ---- store ---------------------------------------------------------------
+
+
+def current(db, kind, key):
+    row = db.execute(
+        "SELECT hash FROM current_artifacts WHERE json_extract(spec,'$.type')=? "
+        "AND json_extract(spec,'$.session_id')=? ORDER BY created_at DESC LIMIT 1",
+        (kind, key),
+    ).fetchone()
+    return row[0] if row else None
+
+
+def put(db, spec, text, stats):
+    prev = current(db, spec["type"], spec["session_id"])
+    p = subprocess.run(
+        [CE, "ingest", "--stdin", "--spec", json.dumps(spec, ensure_ascii=False)],
+        input=text, capture_output=True, text=True,
+    )
+    if p.returncode != 0:
+        print(f"ce ingest failed for {spec['session_id']}: {p.stderr.strip()}", file=sys.stderr)
+        stats["failed"] += 1
+        return
+    new = json.loads(p.stdout.splitlines()[-1])["hash"]
+    if prev == new:
+        stats["unchanged"] += 1
+        return
+    if prev:
+        subprocess.run([CE, "supersede", new, prev], check=True, capture_output=True)
+        stats["updated"] += 1
+    else:
+        stats["new"] += 1
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--claude-code", action="append", default=[], metavar="DIR")
+    ap.add_argument("--claude-ai", action="append", default=[], metavar="FILE")
+    ap.add_argument("--skip", action="append", default=[], metavar="REGEX",
+                    help="leave out Claude Code files whose path matches (e.g. work projects)")
+    a = ap.parse_args()
+    skip = [re.compile(r, re.I) for r in a.skip]
+    db = sqlite3.connect(f"file:{os.environ['CE_DB']}?mode=ro", uri=True)
+    db.execute("PRAGMA busy_timeout = 60000")
+
+    stats = {"new": 0, "updated": 0, "unchanged": 0, "empty": 0, "failed": 0}
+    sessions = claude_code_sessions(a.claude_code, skip)
+    for sid, path in sorted(sessions.items()):
+        lines, meta = render_claude_code(path)
+        if not lines:
+            stats["empty"] += 1
+            continue
+        project = meta["cwd"] or os.path.basename(os.path.dirname(path))
+        title = meta["titles"][-1] if meta["titles"] else ""
+        head = [f"# Claude Code session {sid}", f"project: {project}"]
+        if title:
+            head.append(f"title: {title}")
+        head.append(f"from {ts(meta['first'])} to {ts(meta['last'])}")
+        text = "\n".join(head) + "\n\n" + "\n\n".join(lines) + "\n"
+        spec = {
+            "type": "claude-code-session", "repeatability": "volatile", "session_id": sid,
+            "project": project, "path": path, "started_at": meta["first"], "ended_at": meta["last"],
+            "renderer": RENDERER,
+        }
+        if title:
+            spec["title"] = title
+        put(db, spec, text, stats)
+
+    for export in a.claude_ai:
+        with open(export, encoding="utf-8") as f:
+            convs = json.load(f)
+        for c in convs:
+            lines = render_claude_ai(c)
+            if not lines:
+                stats["empty"] += 1
+                continue
+            head = [f"# claude.ai: {c.get('name') or '(untitled)'}",
+                    f"from {ts(c.get('created_at'))} to {ts(c.get('updated_at'))}"]
+            if c.get("summary"):
+                head.append(f"summary: {c['summary'].strip()}")
+            text = "\n".join(head) + "\n\n" + "\n\n".join(lines) + "\n"
+            spec = {
+                "type": "claude-ai-conversation", "repeatability": "stable", "session_id": c["uuid"],
+                "title": c.get("name") or "", "export": export,
+                "started_at": c.get("created_at"), "ended_at": c.get("updated_at"), "renderer": RENDERER,
+            }
+            put(db, spec, text, stats)
+
+    print(json.dumps({"claude_code_sessions": len(sessions), **stats}))
+
+
+if __name__ == "__main__":
+    main()
