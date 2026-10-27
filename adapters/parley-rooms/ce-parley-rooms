@@ -1,0 +1,155 @@
+#!/usr/bin/env python3
+"""Feed parley chat rooms into a context engine.
+
+parley is a Matrix bot that answers with agent runs. Each room keeps a folder
+with `room.toml` (its profile; `name` is the room's short name) and
+`transcript.jsonl`, one message per line: ts (unix seconds), sender, thread
+(root event id or null), body.
+
+  --rooms DIR   parley's rooms folder (one subfolder per Matrix room id).
+                Rooms without a transcript are skipped.
+
+Each room's day (UTC) becomes one source artifact whose payload is that day's
+messages, oldest first, marked when they sit in a thread. A day is the unit
+because it is what a person looks for ("what did we decide in parley on
+Tuesday") and because a finished day never changes. Today's artifact grows
+during the day; a grown day supersedes its previous version (matched on room
+id and day). Re-running with nothing new adds nothing.
+
+An adapter, not part of the store: it calls `ce` and reads the database only
+to find a day's current version. Python stdlib only; delete this directory
+and `ce` is unaffected.
+
+Usage:
+  ce-parley-rooms [--skip REGEX ...] --rooms DIR
+"""
+
+import argparse
+import json
+import os
+import re
+import sqlite3
+import subprocess
+import sys
+import tomllib
+from datetime import datetime, timezone
+
+CE = os.environ.get("CE", "ce")
+RENDERER = "ce-parley-rooms/1"
+TYPE = "parley-room-day"
+
+
+def who(sender):
+    # "@kas:chat.example" -> "kas"; the bot's own replies are "agent".
+    m = re.match(r"@([^:]+):", sender or "")
+    return m.group(1) if m else (sender or "?")
+
+
+def room_name(folder):
+    try:
+        with open(os.path.join(folder, "room.toml"), "rb") as f:
+            return tomllib.load(f).get("name")
+    except (OSError, tomllib.TOMLDecodeError):
+        return None
+
+
+def days(path):
+    """UTC day -> messages of that day, oldest first."""
+    out = {}
+    with open(path, encoding="utf-8", errors="replace") as f:
+        for raw in f:
+            try:
+                m = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(m, dict) or not (m.get("body") or "").strip() or not m.get("ts"):
+                continue
+            day = datetime.fromtimestamp(m["ts"], timezone.utc).strftime("%Y-%m-%d")
+            out.setdefault(day, []).append(m)
+    for msgs in out.values():
+        msgs.sort(key=lambda m: m["ts"])
+    return out
+
+
+def render(name, room_id, day, msgs):
+    threads = {}
+    lines = []
+    for m in msgs:
+        stamp = datetime.fromtimestamp(m["ts"], timezone.utc).strftime("%H:%M")
+        where = ""
+        if m.get("thread"):
+            n = threads.setdefault(m["thread"], len(threads) + 1)
+            where = f" (thread {n})"
+        lines.append(f"[{stamp}]{where} {who(m.get('sender'))}: {m['body'].strip()}")
+    head = [f"# parley room {name or room_id}, {day} (UTC)", f"room: {room_id}"]
+    if threads:
+        head.append(f"threads: {len(threads)}")
+    return "\n".join(head) + "\n\n" + "\n\n".join(lines) + "\n"
+
+
+def current(db, key):
+    row = db.execute(
+        "SELECT hash FROM current_artifacts WHERE json_extract(spec,'$.type')=? "
+        "AND json_extract(spec,'$.key')=? ORDER BY created_at DESC LIMIT 1",
+        (TYPE, key),
+    ).fetchone()
+    return row[0] if row else None
+
+
+def put(db, spec, text, stats):
+    prev = current(db, spec["key"])
+    p = subprocess.run(
+        [CE, "ingest", "--stdin", "--spec", json.dumps(spec, ensure_ascii=False)],
+        input=text, capture_output=True, text=True,
+    )
+    if p.returncode != 0:
+        print(f"ce ingest failed for {spec['key']}: {p.stderr.strip()}", file=sys.stderr)
+        stats["failed"] += 1
+        return
+    new = json.loads(p.stdout.splitlines()[-1])["hash"]
+    if prev == new:
+        stats["unchanged"] += 1
+        return
+    if prev:
+        subprocess.run([CE, "supersede", new, prev], check=True, capture_output=True)
+        stats["updated"] += 1
+    else:
+        stats["new"] += 1
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--rooms", action="append", default=[], metavar="DIR", required=True)
+    ap.add_argument("--skip", action="append", default=[], metavar="REGEX",
+                    help="leave out rooms whose id or name matches")
+    a = ap.parse_args()
+    skip = [re.compile(r, re.I) for r in a.skip]
+    db = sqlite3.connect(f"file:{os.environ['CE_DB']}?mode=ro", uri=True)
+    db.execute("PRAGMA busy_timeout = 60000")
+
+    stats = {"rooms": 0, "new": 0, "updated": 0, "unchanged": 0, "failed": 0}
+    for root in a.rooms:
+        for room_id in sorted(os.listdir(root)):
+            folder = os.path.join(root, room_id)
+            path = os.path.join(folder, "transcript.jsonl")
+            if not os.path.isfile(path):
+                continue
+            name = room_name(folder)
+            if any(r.search(room_id) or (name and r.search(name)) for r in skip):
+                continue
+            stats["rooms"] += 1
+            for day, msgs in sorted(days(path).items()):
+                spec = {
+                    "type": TYPE, "repeatability": "volatile", "key": f"{room_id}/{day}",
+                    "room_id": room_id, "day": day, "path": path,
+                    "started_at": msgs[0]["ts"], "ended_at": msgs[-1]["ts"], "renderer": RENDERER,
+                }
+                if name:
+                    spec["room"] = name
+                put(db, spec, render(name, room_id, day, msgs), stats)
+
+    print(json.dumps(stats))
+
+
+if __name__ == "__main__":
+    main()
