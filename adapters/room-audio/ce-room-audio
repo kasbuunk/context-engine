@@ -1,0 +1,160 @@
+#!/usr/bin/env python3
+"""Feed transcribed room audio (an always-on microphone) into a context engine.
+
+A room microphone mostly hears an empty room, music, television and guests.
+What is worth context is what the people who live there said. A transcriber
+upstream writes one JSON sidecar per audio file (<file>.<version>.json) with
+every segment it heard: start/end seconds, text, and `speaker` (a name when
+a voiceprint matched with margin, else null), plus the file's wall-clock
+`start` and `camera`.
+
+  --archive DIR   tree of sidecars (searched recursively)
+  --version V     sidecar version to read (the transcriber's VERSION)
+  --people A,B    only these speakers' lines are stored; everyone else
+                  (unnamed voices, TV, other enrolled people) is counted
+
+One source artifact per microphone per local day. Its payload is the named
+lines in order, consecutive lines of one speaker joined, with a header that
+counts what was left out, so an agent knows the gaps exist without the
+content. The spec points at the day's sidecars. A day grows while it is
+being transcribed; a grown day supersedes its previous version (matched on
+camera and day). Re-running with nothing new adds nothing.
+
+An adapter, not part of the store: it calls `ce` and reads the database only
+to find a day's current version. Python stdlib only.
+
+Usage:
+  ce-room-audio --archive DIR --version V --people A,B[,...] [--label NAME]
+"""
+
+import argparse
+import json
+import os
+import sqlite3
+import subprocess
+import sys
+from datetime import datetime, timedelta
+from pathlib import Path
+
+CE = os.environ.get("CE", "ce")
+RENDERER = "ce-room-audio/1"
+TYPE = "room-audio-day"
+JOIN_GAP = 20.0  # seconds; same speaker within this joins one line
+
+
+def load(archive, version):
+    """(camera, day) -> list of sidecar dicts, oldest first."""
+    out = {}
+    for p in Path(archive).rglob(f"*.{version}.json"):
+        try:
+            d = json.loads(p.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not d.get("start"):
+            continue
+        d["_path"] = str(p)
+        d["_t0"] = datetime.fromisoformat(d["start"])
+        cam = d.get("camera") or p.parts[-5]
+        out.setdefault((cam, d["_t0"].strftime("%Y-%m-%d")), []).append(d)
+    for v in out.values():
+        v.sort(key=lambda d: d["_t0"])
+    return out
+
+
+def render(label, cam, day, files, people):
+    lines, counts, other = [], {}, {"lines": 0, "seconds": 0.0}
+    cur = None  # (speaker, start datetime, last end datetime, [texts])
+    for d in files:
+        for s in d.get("segments", []):
+            who = s.get("speaker")
+            t0 = d["_t0"] + timedelta(seconds=s["s"])
+            t1 = d["_t0"] + timedelta(seconds=s["e"])
+            if who not in people:
+                other["lines"] += 1
+                other["seconds"] += s["e"] - s["s"]
+                continue
+            counts[who] = counts.get(who, 0) + 1
+            if cur and cur[0] == who and (t0 - cur[2]).total_seconds() <= JOIN_GAP:
+                cur[2] = t1
+                cur[3].append(s["text"])
+                continue
+            if cur:
+                lines.append(cur)
+            cur = [who, t0, t1, [s["text"]]]
+    if cur:
+        lines.append(cur)
+    covered = sorted(d["_t0"].strftime("%H:%M") for d in files)
+    silent = sum(1 for d in files if d.get("skipped") == "silent")
+    head = [
+        f"# {label or cam} audio, {day}",
+        f"microphone: {cam}; transcribed automatically, speakers by voiceprint",
+        f"files: {len(files)} half-hours ({covered[0]}-{covered[-1]}), {silent} silent",
+        "named lines: " + (", ".join(f"{k} {v}" for k, v in sorted(counts.items())) or "none"),
+        f"left out: {other['lines']} lines, {other['seconds'] / 60:.0f} min of other or unrecognised speech (TV, music, guests, unclear voices)",
+    ]
+    body = [f"[{w[1].strftime('%H:%M')}] {w[0]}: {' '.join(w[3])}" for w in lines]
+    return "\n".join(head) + "\n\n" + "\n".join(body) + "\n", counts
+
+
+def current(db, key):
+    row = db.execute(
+        "SELECT hash FROM current_artifacts WHERE json_extract(spec,'$.type')=? "
+        "AND json_extract(spec,'$.key')=? ORDER BY created_at DESC LIMIT 1",
+        (TYPE, key),
+    ).fetchone()
+    return row[0] if row else None
+
+
+def put(db, spec, text, stats):
+    prev = current(db, spec["key"])
+    p = subprocess.run(
+        [CE, "ingest", "--stdin", "--spec", json.dumps(spec, ensure_ascii=False)],
+        input=text, capture_output=True, text=True,
+    )
+    if p.returncode != 0:
+        print(f"ce ingest failed for {spec['key']}: {p.stderr.strip()}", file=sys.stderr)
+        stats["failed"] += 1
+        return
+    new = json.loads(p.stdout.splitlines()[-1])["hash"]
+    if prev == new:
+        stats["unchanged"] += 1
+        return
+    if prev:
+        subprocess.run([CE, "supersede", new, prev], check=True, capture_output=True)
+        stats["updated"] += 1
+    else:
+        stats["new"] += 1
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--archive", required=True)
+    ap.add_argument("--version", required=True)
+    ap.add_argument("--people", required=True)
+    ap.add_argument("--label", help="room name for the header, e.g. 'living room'")
+    a = ap.parse_args()
+    people = {p.strip() for p in a.people.split(",") if p.strip()}
+    db = sqlite3.connect(f"file:{os.environ['CE_DB']}?mode=ro", uri=True)
+    db.execute("PRAGMA busy_timeout = 60000")
+
+    stats = {"days": 0, "new": 0, "updated": 0, "unchanged": 0, "empty": 0, "failed": 0}
+    for (cam, day), files in sorted(load(a.archive, a.version).items()):
+        text, counts = render(a.label, cam, day, files, people)
+        if not counts:
+            stats["empty"] += 1
+            continue
+        stats["days"] += 1
+        spec = {
+            "type": TYPE, "repeatability": "volatile", "key": f"{cam}/{day}",
+            "camera": cam, "day": day, "transcriber": a.version,
+            "path": str(Path(files[0]["_path"]).parent),
+            "started_at": files[0]["start"], "renderer": RENDERER,
+        }
+        if a.label:
+            spec["room"] = a.label
+        put(db, spec, text, stats)
+    print(json.dumps(stats))
+
+
+if __name__ == "__main__":
+    main()

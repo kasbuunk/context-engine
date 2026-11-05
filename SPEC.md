@@ -76,6 +76,7 @@ An agent reads the store for context, so an artifact should be the smallest unit
 
 - **Conversations** (chat rooms, Messages): one artifact per conversation per day, both sides. One side of a conversation is not readable.
 - **Measurements** (Apple Health, photo GPS): a deterministic digest per month, a line per day with the few figures that mean something (steps, resting heart rate; places, distance from home). The rows stay in the source pipeline; the spec says how to rebuild the digest. Heart-rate samples and GPS points never enter the store.
+- **Ambient audio** (an always-on room microphone): one artifact per microphone per day holding only the lines a voiceprint attributes to the household; TV, music, guests and unrecognised voices are counted in the header, not stored. The full transcript, named or not, stays in the transcriber's sidecars next to the audio, so the people filter can change without transcribing again (`adapters/room-audio`).
 - **Bulk** (newsletters, notifications): counted, not stored. A count per sender is context; the content is noise.
 - **Themes and trends** (what a chat was about this quarter, how a health metric moved this year) are interpretation, so they are `llm` syntheses with `subject` edges to the digests or days they rest on, built when a question needs them rather than in advance.
 
