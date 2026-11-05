@@ -70,6 +70,17 @@ Never store a credential value in the spec. Store a *reference* to one instead, 
 - **Binary content** (`.wav`, images, PDFs) gets `payload = NULL`. The bytes are stored at `blobs/<first 2 hex chars>/<remaining hex>`, which is Git-style fanout. Searchable text for a binary comes from a downstream synthesis, such as a transcription or a caption.
 - `blob_path` stays NULL when the path can be derived from the hash. Set it only when the bytes live **elsewhere**, such as a network share or S3, because they are too large to copy.
 
+### 2.3.1 Grain: ingest meaning, not data points (2026-11-05)
+
+An agent reads the store for context, so an artifact should be the smallest unit that carries meaning on its own, not the source's row. Adapters choose the grain per source:
+
+- **Conversations** (chat rooms, Messages): one artifact per conversation per day, both sides. One side of a conversation is not readable.
+- **Measurements** (Apple Health, photo GPS): a deterministic digest per month, a line per day with the few figures that mean something (steps, resting heart rate; places, distance from home). The rows stay in the source pipeline; the spec says how to rebuild the digest. Heart-rate samples and GPS points never enter the store.
+- **Bulk** (newsletters, notifications): counted, not stored. A count per sender is context; the content is noise.
+- **Themes and trends** (what a chat was about this quarter, how a health metric moved this year) are interpretation, so they are `llm` syntheses with `subject` edges to the digests or days they rest on, built when a question needs them rather than in advance.
+
+Structure follows the same rule: no column, table or role is added for a source until a real query needs it (semantics before syntax, built just in time).
+
 ### 2.4 `hash`
 
 The hash is lowercase hex sha256, computed as follows:

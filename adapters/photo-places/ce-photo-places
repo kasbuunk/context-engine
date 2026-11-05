@@ -1,0 +1,112 @@
+#!/usr/bin/env python3
+"""Feed where-was-I, derived from photo GPS, into a context engine per month.
+
+Reads a location database with tables `visits` (ts_start, ts_end,
+photo_count, place, town, admin1, admin2, country_name, km_from_home,
+trip_id) and `trips` (trip_id, ts_start, ts_end, days, countries, places,
+max_km_from_home), as built by a photo-location pipeline that clusters
+geotagged photos into visits and away-from-home runs into trips.
+
+  --db FILE   the location database (opened read-only)
+  --tz ZONE   day boundary (default Europe/Amsterdam)
+
+Points are data, places are context. The unit is a month: the trips that
+touch it, then one line per day with the places visited, the nearest town,
+region, country and distance from home. Days at home are folded into one
+count. Photo GPS is a lower bound: no photo, no trace. Every digest says so,
+so an agent does not read a quiet month as "stayed home".
+
+A month that changes supersedes its previous version; re-running with
+nothing new calls `ce` for no month. An adapter, not part of the store.
+Python stdlib only.
+
+Usage:
+  ce-photo-places --db FILE
+"""
+
+import argparse
+import hashlib
+import json
+import os
+import sqlite3
+import subprocess
+import sys
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+CE = os.environ.get("CE", "ce")
+RENDERER = "ce-photo-places/1"
+TYPE = "photo-places-month"
+HOME_KM = 15
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--db", required=True, metavar="FILE")
+    ap.add_argument("--tz", default="Europe/Amsterdam")
+    a = ap.parse_args()
+    tz = ZoneInfo(a.tz)
+    day = lambda ts: datetime.fromtimestamp(ts, tz).strftime("%Y-%m-%d")
+    src = sqlite3.connect(f"file:{os.path.abspath(a.db)}?mode=ro", uri=True)
+    meta = dict(src.execute("SELECT key, value FROM meta"))
+    home = meta.get("home_place")
+
+    months = {}
+    for ts, n, place, town, a1, a2, country, km in src.execute(
+            "SELECT ts_start, photo_count, place, town, admin1, admin2, country_name, km_from_home "
+            "FROM visits ORDER BY ts_start"):
+        d = day(ts)
+        m = months.setdefault(d[:7], {"days": {}, "home": set(), "trips": {}})
+        if km is not None and km < HOME_KM:
+            m["home"].add(d)
+            continue
+        where = ", ".join(dict.fromkeys(x for x in (place, town, a2 or a1, country) if x))
+        m["days"].setdefault(d, []).append(f"{where} ({km:.0f} km from home, {n} photos)")
+    for tid, t0, t1, ndays, countries, places, maxkm in src.execute(
+            "SELECT trip_id, ts_start, ts_end, days, countries, places, max_km_from_home FROM trips"):
+        line = f"{day(t0)} to {day(t1)} ({ndays} days, up to {maxkm:.0f} km): {countries}; {places}"
+        mo = day(t0)[:7]
+        while mo <= day(t1)[:7]:
+            months.setdefault(mo, {"days": {}, "home": set(), "trips": {}})["trips"][tid] = line
+            y, mm = int(mo[:4]), int(mo[5:]) + 1
+            mo = f"{y + (mm > 12)}-{(mm - 1) % 12 + 1:02d}"
+
+    store = sqlite3.connect(f"file:{os.environ['CE_DB']}?mode=ro", uri=True)
+    store.execute("PRAGMA busy_timeout = 60000")
+    cur = dict(store.execute(
+        "SELECT json_extract(spec,'$.key'), hash FROM current_artifacts WHERE json_extract(spec,'$.type')=? "
+        "ORDER BY created_at", (TYPE,)).fetchall())
+    stats = {"months": len(months), "new": 0, "updated": 0, "unchanged": 0, "failed": 0}
+    for mo, m in sorted(months.items()):
+        head = [f"# Places, {mo} (from photo GPS)",
+                "source: geotagged photos only; a day without photos leaves no trace, so absence here is not evidence of absence"]
+        if m["home"]:
+            head.append(f"days with photos at home{f' ({home})' if home else ''}: {len(m['home'])}")
+        if m["trips"]:
+            head.append("trips away from home:")
+            head += [f"- {t}" for _, t in sorted(m["trips"].items())]
+        body = [f"{d}: " + "; ".join(v) for d, v in sorted(m["days"].items())]
+        text = "\n".join(head) + "\n\n" + "\n".join(body) + "\n"
+        prev = cur.get(mo)
+        if prev == hashlib.sha256(text.encode()).hexdigest():
+            stats["unchanged"] += 1
+            continue
+        spec = {"type": TYPE, "repeatability": "stable", "key": mo, "month": mo,
+                "db": os.path.abspath(a.db), "places_built_at": meta.get("places_built_at"), "renderer": RENDERER}
+        p = subprocess.run([CE, "ingest", "--stdin", "--spec", json.dumps(spec, ensure_ascii=False)],
+                           input=text, capture_output=True, text=True)
+        if p.returncode != 0:
+            print(f"ce ingest failed for {mo}: {p.stderr.strip()}", file=sys.stderr)
+            stats["failed"] += 1
+            continue
+        new = json.loads(p.stdout.splitlines()[-1])["hash"]
+        if prev:
+            subprocess.run([CE, "supersede", new, prev], check=True, capture_output=True)
+            stats["updated"] += 1
+        else:
+            stats["new"] += 1
+    print(json.dumps(stats))
+
+
+if __name__ == "__main__":
+    main()

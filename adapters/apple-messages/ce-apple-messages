@@ -1,0 +1,186 @@
+#!/usr/bin/env python3
+"""Feed Apple Messages (iMessage, SMS) into a context engine.
+
+Reads the normalised database built by a Messages export pipeline (tables
+`chats`, `messages`, `chat_message_join`, `attachments`,
+`message_attachment_join`; text in `text` or, for newer rows, `text_decoded`;
+`ts_utc` unix seconds).
+
+  --db FILE         the messages database (opened read-only)
+  --contacts FILE   optional contacts database (tables `contacts`, `phones`,
+                    `emails`) to show names instead of phone numbers
+  --me NAME         how the owner's own messages are labelled (default "me")
+  --tz ZONE         the day boundary and clock times (default Europe/Amsterdam)
+  --skip REGEX      leave out chats whose identifier, name or participant
+                    names match; repeatable. Skipped chats are counted only.
+
+One source artifact per chat per local day: the conversation is the unit a
+person looks for ("what did Camille and I say about the school on Tuesday"),
+and a finished day never changes. Both sides are kept, because one side of a
+conversation is not readable. Tapbacks, edits-as-events and system rows are
+left out; attachments and voice messages show as a bracketed marker with the
+file name. A day that grows supersedes its previous version (key: chat guid
+and day). Re-running with nothing new adds nothing, and costs no `ce` calls:
+the content hash is computed here and compared with the current version.
+
+An adapter, not part of the store: it calls `ce` and reads the store only to
+find current versions. Python stdlib only.
+
+Usage:
+  ce-apple-messages [--contacts FILE] [--me NAME] [--skip REGEX ...] --db FILE
+"""
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import sqlite3
+import subprocess
+import sys
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+CE = os.environ.get("CE", "ce")
+RENDERER = "ce-apple-messages/1"
+TYPE = "apple-messages-day"
+
+
+def phone_key(s):
+    d = re.sub(r"\D", "", s or "")
+    return d[-9:] if len(d) >= 9 else None
+
+
+def load_contacts(path):
+    names = {}
+    if not path or not os.path.isfile(path):
+        return names
+    c = sqlite3.connect(f"file:{os.path.abspath(path)}?mode=ro", uri=True)
+    disp = {}
+    for uuid, dn, fn, ln, nick, org in c.execute(
+        "SELECT uuid, display_name, first_name, last_name, nickname, organization FROM contacts"
+    ):
+        n = (dn or " ".join(x for x in (fn, ln) if x) or nick or org or "").strip()
+        if n:
+            disp[uuid] = n
+    for uuid, num in c.execute("SELECT contact_uuid, full_number FROM phones"):
+        k = phone_key(num)
+        if k and uuid in disp:
+            names.setdefault(k, disp[uuid])
+    for uuid, addr in c.execute("SELECT contact_uuid, address FROM emails"):
+        if addr and uuid in disp:
+            names.setdefault(addr.strip().lower(), disp[uuid])
+    return names
+
+
+def name_of(handle, names):
+    if not handle:
+        return "?"
+    return names.get(phone_key(handle)) or names.get(handle.strip().lower()) or handle
+
+
+def render(title, kind, service, day, parts, lines):
+    head = [f"# Messages: {title}, {day}", f"chat: {kind}, {service}"]
+    if parts:
+        head.append("with: " + ", ".join(parts))
+    return "\n".join(head) + "\n\n" + "\n".join(lines) + "\n"
+
+
+def current_map(db):
+    return dict(db.execute(
+        "SELECT json_extract(spec,'$.key'), hash FROM current_artifacts "
+        "WHERE json_extract(spec,'$.type')=? ORDER BY created_at",
+        (TYPE,),
+    ).fetchall())
+
+
+def put(cur, spec, text, stats):
+    prev = cur.get(spec["key"])
+    if prev == hashlib.sha256(text.encode()).hexdigest():
+        stats["unchanged"] += 1
+        return
+    p = subprocess.run(
+        [CE, "ingest", "--stdin", "--spec", json.dumps(spec, ensure_ascii=False)],
+        input=text, capture_output=True, text=True,
+    )
+    if p.returncode != 0:
+        print(f"ce ingest failed for {spec['key']}: {p.stderr.strip()}", file=sys.stderr)
+        stats["failed"] += 1
+        return
+    new = json.loads(p.stdout.splitlines()[-1])["hash"]
+    if prev and prev != new:
+        subprocess.run([CE, "supersede", new, prev], check=True, capture_output=True)
+        stats["updated"] += 1
+    elif prev:
+        stats["unchanged"] += 1
+    else:
+        stats["new"] += 1
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--db", required=True, metavar="FILE")
+    ap.add_argument("--contacts", metavar="FILE")
+    ap.add_argument("--me", default="me")
+    ap.add_argument("--tz", default="Europe/Amsterdam")
+    ap.add_argument("--skip", action="append", default=[], metavar="REGEX")
+    a = ap.parse_args()
+    tz = ZoneInfo(a.tz)
+    skip = [re.compile(r, re.I) for r in a.skip]
+    names = load_contacts(a.contacts)
+    src = sqlite3.connect(f"file:{os.path.abspath(a.db)}?mode=ro", uri=True)
+    store = sqlite3.connect(f"file:{os.environ['CE_DB']}?mode=ro", uri=True)
+    store.execute("PRAGMA busy_timeout = 60000")
+    cur = current_map(store)
+
+    att = {}
+    for mg, tn, fn, mime in src.execute(
+        "SELECT j.message_guid, a.transfer_name, a.filename, a.mime_type "
+        "FROM message_attachment_join j JOIN attachments a ON a.guid = j.attachment_guid"
+    ):
+        att.setdefault(mg, []).append(tn or os.path.basename(fn or "") or mime or "file")
+
+    chats = {g: (ci, sv, dn, st) for g, ci, sv, dn, st in src.execute(
+        "SELECT guid, chat_identifier, service_name, display_name, style FROM chats")}
+
+    # chat guid -> day -> [(ts, line)]
+    convo, members = {}, {}
+    rows = src.execute(
+        "SELECT j.chat_guid, m.guid, m.ts_utc, m.is_from_me, m.handle, "
+        "COALESCE(NULLIF(m.text,''), m.text_decoded), m.is_audio_message, m.balloon_bundle_id "
+        "FROM chat_message_join j JOIN messages m ON m.guid = j.message_guid "
+        "WHERE COALESCE(m.associated_message_type,0) = 0 AND COALESCE(m.item_type,0) = 0 "
+        "AND m.ts_utc IS NOT NULL ORDER BY m.ts_utc"
+    )
+    for cg, mg, ts, mine, handle, text, audio, balloon in rows:
+        when = datetime.fromtimestamp(ts, tz)
+        who = a.me if mine else name_of(handle, names)
+        if not mine and handle:
+            members.setdefault(cg, {}).setdefault(who, None)
+        body = (text or "").replace("￼", "").strip()
+        marks = [f"[{'voice message' if audio else 'attachment'}: {n}]" for n in att.get(mg, [])]
+        if not body and not marks:
+            continue
+        line = f"[{when:%H:%M}] {who}: " + " ".join(x for x in [body] + marks if x)
+        convo.setdefault(cg, {}).setdefault(when.strftime("%Y-%m-%d"), []).append(line)
+
+    stats = {"chats": 0, "skipped_chats": 0, "new": 0, "updated": 0, "unchanged": 0, "failed": 0}
+    for cg in sorted(convo):
+        ci, sv, dn, style = chats.get(cg, (cg, None, None, None))
+        parts = list(members.get(cg, {}))
+        group = style == 43 or len(parts) > 1
+        title = dn or (", ".join(parts) if parts else name_of(ci, names))
+        if any(r.search(x) for r in skip for x in [ci or "", dn or "", title] + parts):
+            stats["skipped_chats"] += 1
+            continue
+        stats["chats"] += 1
+        for day, lines in sorted(convo[cg].items()):
+            spec = {"type": TYPE, "repeatability": "volatile", "key": f"{cg}/{day}",
+                    "chat": title, "day": day, "db": os.path.abspath(a.db), "renderer": RENDERER}
+            put(cur, spec, render(title, "group" if group else "1:1", sv or "?", day,
+                                  parts if group else [], lines), stats)
+    print(json.dumps(stats))
+
+
+if __name__ == "__main__":
+    main()

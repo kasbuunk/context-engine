@@ -1,0 +1,150 @@
+#!/usr/bin/env python3
+"""Feed Apple Health into a context engine as one digest per month.
+
+Reads the database built by an Apple Health export pipeline (tables
+`imports`, `records`, `workouts`; dates as "YYYY-MM-DD HH:MM:SS +ZZZZ" local
+time). Each export is a full history, so only the newest import is read;
+older imports would double every count.
+
+  --db FILE   the health database (opened read-only)
+
+Heart-rate samples and step records are data points, not context: an agent
+asking "how was I doing in March 2024" needs the shape of the month, not
+40,000 rows. So the unit is a month: a header with monthly averages and a
+line per day with the few figures that carry meaning (steps, distance,
+flights, resting heart rate, HRV, walking speed, VO2 max, workouts, mindful
+minutes). Days without any figure are left out. Steps and distance are the
+highest single source per day, because the phone and the watch both count
+the same walk. The raw rows stay in the health database; the spec says how
+to rebuild a digest.
+
+A month that changes (a new export filled it in) supersedes its previous
+version. Re-running with nothing new adds nothing and calls `ce` for no
+month. An adapter, not part of the store. Python stdlib only.
+
+Usage:
+  ce-apple-health --db FILE
+"""
+
+import argparse
+import hashlib
+import json
+import os
+import sqlite3
+import subprocess
+import sys
+from statistics import mean
+
+CE = os.environ.get("CE", "ce")
+RENDERER = "ce-apple-health/1"
+TYPE = "apple-health-month"
+HK = "HKQuantityTypeIdentifier"
+
+# figure -> (record type, per-day aggregate, per-source max?)
+SUMS = {"steps": f"{HK}StepCount", "km": f"{HK}DistanceWalkingRunning", "flights": f"{HK}FlightsClimbed"}
+AVGS = {"rhr": f"{HK}RestingHeartRate", "hrv": f"{HK}HeartRateVariabilitySDNN",
+        "walk_kmh": f"{HK}WalkingSpeed", "vo2max": f"{HK}VO2Max"}
+MINDFUL = "HKCategoryTypeIdentifierMindfulSession"
+
+
+def collect(src, imp):
+    days = {}
+    for name, t in SUMS.items():
+        q = ("SELECT d, MAX(v) FROM (SELECT substr(start_date,1,10) d, source_name, SUM(CAST(value AS REAL)) v "
+             "FROM records WHERE import_id=? AND type=? GROUP BY 1,2) GROUP BY d")
+        for d, v in src.execute(q, (imp, t)):
+            days.setdefault(d, {})[name] = v
+    for name, t in AVGS.items():
+        for d, v in src.execute("SELECT substr(start_date,1,10), AVG(CAST(value AS REAL)) FROM records "
+                                "WHERE import_id=? AND type=? GROUP BY 1", (imp, t)):
+            days.setdefault(d, {})[name] = v
+    for d, mins in src.execute(
+            "SELECT substr(start_date,1,10), SUM((julianday(substr(end_date,1,19))-julianday(substr(start_date,1,19)))*1440) "
+            "FROM records WHERE import_id=? AND type=? GROUP BY 1", (imp, MINDFUL)):
+        days.setdefault(d, {})["mindful"] = mins
+    for d, act, dur, unit, dist, dunit in src.execute(
+            "SELECT substr(start_date,1,10), activity_type, duration, duration_unit, total_distance, total_distance_unit "
+            "FROM workouts WHERE import_id=? ORDER BY start_date", (imp,)):
+        w = act.removeprefix("HKWorkoutActivityType").lower()
+        if dur:
+            w += f" {dur:.0f}{unit or 'min'}"
+        if dist:
+            w += f" {dist:.1f}{dunit or ''}"
+        days.setdefault(d, {}).setdefault("workouts", []).append(w)
+    return days
+
+
+def fmt_day(d, f):
+    bits = []
+    if "steps" in f: bits.append(f"{f['steps']:.0f} steps")
+    if "km" in f: bits.append(f"{f['km']:.1f} km")
+    if f.get("flights"): bits.append(f"{f['flights']:.0f} flights")
+    if "rhr" in f: bits.append(f"resting HR {f['rhr']:.0f}")
+    if "hrv" in f: bits.append(f"HRV {f['hrv']:.0f} ms")
+    if "walk_kmh" in f: bits.append(f"walking {f['walk_kmh']:.1f} km/h")
+    if "vo2max" in f: bits.append(f"VO2max {f['vo2max']:.1f}")
+    if f.get("mindful"): bits.append(f"mindful {f['mindful']:.0f} min")
+    if f.get("workouts"): bits.append("workout: " + "; ".join(f["workouts"]))
+    return f"{d}: " + ", ".join(bits)
+
+
+def render(month, days):
+    def avg(k):
+        v = [f[k] for f in days.values() if k in f]
+        return mean(v) if v else None
+    head = [f"# Apple Health, {month}", f"days with data: {len(days)}"]
+    for k, label, unit in (("steps", "steps/day", ""), ("km", "walking+running km/day", ""),
+                           ("rhr", "resting heart rate", " bpm"), ("hrv", "HRV", " ms"),
+                           ("vo2max", "VO2 max", "")):
+        a = avg(k)
+        if a is not None:
+            head.append(f"average {label}: {a:.1f}{unit}" if k in ("km", "vo2max") else f"average {label}: {a:.0f}{unit}")
+    nw = sum(len(f.get("workouts", [])) for f in days.values())
+    if nw:
+        head.append(f"workouts: {nw}")
+    if not any("rhr" in f or "hrv" in f for f in days.values()):
+        head.append("no watch data this month (phone only, or none)")
+    return "\n".join(head) + "\n\n" + "\n".join(fmt_day(d, days[d]) for d in sorted(days)) + "\n"
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--db", required=True, metavar="FILE")
+    a = ap.parse_args()
+    src = sqlite3.connect(f"file:{os.path.abspath(a.db)}?mode=ro", uri=True)
+    imp, export_date = src.execute("SELECT id, export_date FROM imports ORDER BY export_date DESC LIMIT 1").fetchone()
+    store = sqlite3.connect(f"file:{os.environ['CE_DB']}?mode=ro", uri=True)
+    store.execute("PRAGMA busy_timeout = 60000")
+    cur = dict(store.execute(
+        "SELECT json_extract(spec,'$.key'), hash FROM current_artifacts WHERE json_extract(spec,'$.type')=? "
+        "ORDER BY created_at", (TYPE,)).fetchall())
+
+    months = {}
+    for d, f in collect(src, imp).items():
+        months.setdefault(d[:7], {})[d] = f
+    stats = {"months": len(months), "new": 0, "updated": 0, "unchanged": 0, "failed": 0}
+    for month, days in sorted(months.items()):
+        text = render(month, days)
+        prev = cur.get(month)
+        if prev == hashlib.sha256(text.encode()).hexdigest():
+            stats["unchanged"] += 1
+            continue
+        spec = {"type": TYPE, "repeatability": "stable", "key": month, "month": month,
+                "db": os.path.abspath(a.db), "import_export_date": export_date, "renderer": RENDERER}
+        p = subprocess.run([CE, "ingest", "--stdin", "--spec", json.dumps(spec)],
+                           input=text, capture_output=True, text=True)
+        if p.returncode != 0:
+            print(f"ce ingest failed for {month}: {p.stderr.strip()}", file=sys.stderr)
+            stats["failed"] += 1
+            continue
+        new = json.loads(p.stdout.splitlines()[-1])["hash"]
+        if prev:
+            subprocess.run([CE, "supersede", new, prev], check=True, capture_output=True)
+            stats["updated"] += 1
+        else:
+            stats["new"] += 1
+    print(json.dumps(stats))
+
+
+if __name__ == "__main__":
+    main()
