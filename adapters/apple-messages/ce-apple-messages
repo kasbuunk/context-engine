@@ -15,7 +15,7 @@ Reads the normalised database built by a Messages export pipeline (tables
                     names match; repeatable. Skipped chats are counted only.
 
 One source artifact per chat per local day: the conversation is the unit a
-person looks for ("what did Camille and I say about the school on Tuesday"),
+person looks for ("what did we say about the school on Tuesday"),
 and a finished day never changes. Both sides are kept, because one side of a
 conversation is not readable. Tapbacks, edits-as-events and system rows are
 left out; attachments and voice messages show as a bracketed marker with the
