@@ -13,7 +13,8 @@ modification_ts_utc, marked_for_deletion, is_password_protected).
 Each note becomes one source artifact keyed on its Notes identifier; its
 payload is the title, folder and dates, then the plain text. An edited note
 supersedes its previous version. Empty and password-protected notes are left
-out. Re-running with nothing new adds nothing.
+out. Duplicate notes (identical title, dates and text) are one artifact,
+since the hash is the content. Re-running with nothing new adds nothing.
 
 An adapter, not part of the store: it calls `ce` and reads the store only to
 find a note's current version. Python stdlib only.
@@ -72,8 +73,10 @@ def put(db, spec, text, stats):
         print(f"ce ingest failed for {spec['key']}: {p.stderr.strip()}", file=sys.stderr)
         stats["failed"] += 1
         return
-    new = json.loads(p.stdout.splitlines()[-1])["hash"]
-    if prev == new:
+    out = json.loads(p.stdout.splitlines()[-1])
+    new = out["hash"]
+    if prev == new or (not prev and not out.get("created")):
+        # Same note, or a duplicate note whose text the store already holds.
         stats["unchanged"] += 1
     elif prev:
         subprocess.run([CE, "supersede", new, prev], check=True, capture_output=True)
