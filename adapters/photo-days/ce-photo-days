@@ -1,0 +1,131 @@
+#!/usr/bin/env python3
+"""Feed what the camera saw into a context engine, one artifact per day.
+
+Reads a versioned photo-observations DB (tables asset, face, face_cluster,
+cluster_name, ocr, tag, runs; every row has first_run/last_run, current =
+last_run equals the newest run) as built by an extractor from a photo manager.
+The pixels and the embeddings stay there; this renders only what carries
+meaning for an agent: when, where, who, and what text was in view.
+
+  --db FILE      the observations DB (read-only)
+  --names FILE   optional TSV `cluster<TAB>name`, overrides the photo manager's
+                 own names (labels made outside it)
+  --ocr-chars N  OCR text kept per day (default 1500)
+
+People are named only when a cluster has a name; unnamed faces are counted.
+Naming a cluster later changes the text of the days it appears in, and only
+those days are superseded. Re-running with nothing new calls `ce` for no day.
+An adapter, not part of the store. Python stdlib only.
+"""
+import argparse, hashlib, json, os, sqlite3, subprocess, sys
+from collections import Counter, defaultdict
+
+CE = os.environ.get("CE", "ce")
+RENDERER = "ce-photo-days/1"
+TYPE = "photo-day"
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--db", required=True)
+    ap.add_argument("--names")
+    ap.add_argument("--ocr-chars", type=int, default=1500)
+    a = ap.parse_args()
+    src = sqlite3.connect(f"file:{os.path.abspath(a.db)}?mode=ro", uri=True)
+    run, source = src.execute("SELECT run, source FROM runs WHERE finished IS NOT NULL ORDER BY run DESC LIMIT 1").fetchone()
+    names = {c: n for c, n in src.execute("SELECT cluster, name FROM cluster_name WHERE last_run=? AND name IS NOT NULL", (run,))}
+    if a.names:
+        for line in open(a.names, encoding="utf-8"):
+            if line.strip() and not line.startswith("#"):
+                c, n = line.rstrip("\n").split("\t")[:2]
+                names[c] = n
+
+    days = defaultdict(lambda: {"photo": 0, "video": 0, "shot": 0, "fav": 0, "t": [], "places": Counter(),
+                                "people": Counter(), "unnamed": 0, "ocr": [], "tags": Counter()})
+    day_of = {}
+    for sha1, typ, lt, city, state, country, make, name, fav in src.execute(
+            "SELECT sha1, type, local_time, city, state, country, make, original_name, favorite FROM asset "
+            "WHERE last_run=? AND visibility<>'hidden' AND local_time IS NOT NULL ORDER BY local_time", (run,)):
+        d = lt[:10]
+        day_of[sha1] = d
+        x = days[d]
+        shot = typ == "IMAGE" and not make and (name or "").lower().endswith(".png")
+        x["shot" if shot else "video" if typ == "VIDEO" else "photo"] += 1
+        x["fav"] += fav or 0
+        x["t"].append(lt[11:16])
+        place = ", ".join(dict.fromkeys(p for p in (city, state, country) if p))
+        if place:
+            x["places"][place] += 1
+    for sha1, cluster in src.execute(
+            "SELECT f.sha1, c.cluster FROM face f LEFT JOIN face_cluster c ON c.face_key=f.key AND c.last_run=? "
+            "WHERE f.last_run=?", (run, run)):
+        d = day_of.get(sha1)
+        if not d:
+            continue
+        if cluster in names:
+            days[d]["people"][names[cluster]] += 1
+        else:
+            days[d]["unnamed"] += 1
+    for sha1, text in src.execute(
+            "SELECT sha1, text FROM ocr WHERE last_run=? AND text_score>=0.8 ORDER BY sha1, box", (run,)):
+        d = day_of.get(sha1)
+        if d:
+            days[d]["ocr"].append(text.strip())
+    for sha1, tag in src.execute("SELECT sha1, tag FROM tag WHERE last_run=?", (run,)):
+        if day_of.get(sha1):
+            days[day_of[sha1]]["tags"][tag] += 1
+
+    store = sqlite3.connect(f"file:{os.environ['CE_DB']}?mode=ro", uri=True)
+    store.execute("PRAGMA busy_timeout = 60000")
+    cur = dict(store.execute(
+        "SELECT json_extract(spec,'$.key'), hash FROM current_artifacts WHERE json_extract(spec,'$.type')=? "
+        "ORDER BY created_at", (TYPE,)).fetchall())
+    stats = {"days": len(days), "new": 0, "updated": 0, "unchanged": 0, "failed": 0}
+    for d, x in sorted(days.items()):
+        what = [f"{x[k]} {lbl}" for k, lbl in (("photo", "photos"), ("video", "videos"), ("shot", "screenshots")) if x[k]]
+        lines = [f"# Photos, {d}",
+                 f"{', '.join(what)}, {min(x['t'])}–{max(x['t'])} local time" + (f", {x['fav']} favourited" if x["fav"] else ""),
+                 "source: photo library observations; face names and OCR are model output, not verified"]
+        if x["places"]:
+            lines.append("places: " + "; ".join(f"{p} ({n})" for p, n in x["places"].most_common()))
+        if x["people"] or x["unnamed"]:
+            ppl = [f"{p} ({n})" for p, n in sorted(x["people"].items(), key=lambda i: (-i[1], i[0]))]
+            if x["unnamed"]:
+                ppl.append(f"{x['unnamed']} unnamed faces")
+            lines.append("people: " + "; ".join(ppl))
+        if x["tags"]:
+            lines.append("tags: " + ", ".join(t for t, _ in x["tags"].most_common()))
+        if x["ocr"]:
+            seen, txt = set(), []
+            for t in x["ocr"]:
+                if len(t) > 2 and t.lower() not in seen:
+                    seen.add(t.lower()); txt.append(t)
+            ocr = " · ".join(txt)
+            if len(ocr) > a.ocr_chars:
+                ocr = ocr[:a.ocr_chars].rsplit(" ", 1)[0] + " …"
+            if ocr:
+                lines += ["", "text in view (OCR):", ocr]
+        text = "\n".join(lines) + "\n"
+        prev = cur.get(d)
+        if prev == hashlib.sha256(text.encode()).hexdigest():
+            stats["unchanged"] += 1
+            continue
+        spec = {"type": TYPE, "repeatability": "stable", "key": d, "date": d, "db": os.path.abspath(a.db),
+                "observations_run": run, "observations_source": source, "renderer": RENDERER}
+        p = subprocess.run([CE, "ingest", "--stdin", "--spec", json.dumps(spec, ensure_ascii=False)],
+                           input=text, capture_output=True, text=True)
+        if p.returncode != 0:
+            print(f"ce ingest failed for {d}: {p.stderr.strip()}", file=sys.stderr)
+            stats["failed"] += 1
+            continue
+        new = json.loads(p.stdout.splitlines()[-1])["hash"]
+        if prev:
+            subprocess.run([CE, "supersede", new, prev], check=True, capture_output=True)
+            stats["updated"] += 1
+        else:
+            stats["new"] += 1
+    print(json.dumps(stats))
+
+
+if __name__ == "__main__":
+    main()
