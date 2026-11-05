@@ -1,0 +1,264 @@
+#!/usr/bin/env python3
+"""Feed human mail threads into a context engine.
+
+Reads a normalised Apple Mail metadata database (tables `messages`,
+`addresses`, `recipients`, `mailboxes`; `messages.rowid` is the Envelope Index
+ROWID, `ts_sent` unix seconds, `automated_conversation` 2 = machine mail) and,
+optionally, a mirror of Mail's `.emlx` files for bodies.
+
+  --db FILE         the mail metadata database (opened read-only)
+  --mailstore DIR   optional mirror of ~/Library/Mail/V10; a body is used only
+                    when the file's Message-ID matches the row's
+  --me ADDR         an address of the owner; repeatable
+  --contacts FILE   optional contacts database (tables `contacts`, `emails`):
+                    mail from a contact counts as human, and shows by name
+  --keep REGEX      also keep threads with a participant matching; repeatable
+  --skip REGEX      drop threads with a subject or participant matching
+  --mass N          a message to more than N recipients is a mailing, not
+                    a sign of a conversation (default 15)
+  --tz ZONE         clock times (default Europe/Amsterdam)
+
+One source artifact per thread (Mail's conversation): a thread is what a
+person looks for ("the mail with the notary about the deed"). A thread is
+kept when the owner wrote in it (not a mass mailing), or a contact or a
+--keep address wrote in it; everything else (newsletters, notifications,
+receipts) is only counted. A message stored in several mailboxes is shown
+once (Message-ID). Bodies: text part, quoted history and signatures after
+the first reply marker cut, capped. A thread that grows supersedes its
+previous version (key: conversation id). Re-running with nothing new adds
+nothing and makes no `ce` calls.
+
+An adapter, not part of the store: it calls `ce` and reads the store only to
+find current versions. Python stdlib only.
+"""
+
+import argparse
+import email
+import email.policy
+import hashlib
+import html
+import json
+import os
+import re
+import sqlite3
+import subprocess
+import sys
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+CE = os.environ.get("CE", "ce")
+RENDERER = "ce-mail-threads/1"
+TYPE = "mail-thread"
+BODY_CAP = 3000
+
+REPLY_MARK = re.compile(
+    r"^\s*(On .{0,200}wrote:|Op .{0,200}schreef.{0,60}:|Le .{0,200}a écrit\s*:|"
+    r"-{2,}\s*(Original Message|Oorspronkelijk bericht|Forwarded message|Doorgestuurd bericht)|"
+    r"(From|Van|De)\s*:\s.+|_{10,})\s*$", re.I | re.M)
+
+
+def load_contacts(path):
+    names = {}
+    if not path or not os.path.isfile(path):
+        return names
+    c = sqlite3.connect(f"file:{os.path.abspath(path)}?mode=ro", uri=True)
+    disp = {}
+    for uuid, dn, fn, ln, nick, org in c.execute(
+        "SELECT uuid, display_name, first_name, last_name, nickname, organization FROM contacts"):
+        n = (dn or " ".join(x for x in (fn, ln) if x) or nick or org or "").strip()
+        if n:
+            disp[uuid] = n
+    for uuid, addr in c.execute("SELECT contact_uuid, address FROM emails"):
+        if addr and uuid in disp:
+            names.setdefault(addr.strip().lower(), disp[uuid])
+    return names
+
+
+def index_mailstore(root):
+    """Message-ID -> .emlx paths. Mail's file names are Envelope ROWIDs, which
+    a later index may renumber, so files are matched by their own header."""
+    idx = {}
+    if not root:
+        return idx
+    for dp, _, fs in os.walk(root):
+        for f in fs:
+            if not f.endswith(".emlx"):
+                continue
+            p = os.path.join(dp, f)
+            try:
+                with open(p, "rb") as fh:
+                    fh.readline()
+                    head = fh.read(65536).split(b"\r\n\r\n", 1)[0].split(b"\n\n", 1)[0]
+                m = email.message_from_bytes(head + b"\n\n")
+                mid = (m.get("Message-ID") or "").strip()
+            except Exception:
+                continue
+            if mid:
+                # full files first; .partial.emlx has the body elided
+                idx.setdefault(mid, []).insert(0 if not f.endswith(".partial.emlx") else len(idx.get(mid, [])), p)
+    return idx
+
+
+def html_text(s):
+    s = re.sub(r"(?is)<(script|style|head).*?</\1>", " ", s)
+    s = re.sub(r"(?is)<blockquote.*", " ", s)
+    s = re.sub(r"(?i)<br\s*/?>|</p>|</div>|</tr>", "\n", s)
+    return html.unescape(re.sub(r"<[^>]+>", " ", s))
+
+
+def body_of(paths, msgid):
+    for p in paths:
+        try:
+            with open(p, "rb") as fh:
+                n = int(fh.readline().strip() or 0)
+                raw = fh.read(n)
+            m = email.message_from_bytes(raw, policy=email.policy.default)
+        except Exception:
+            continue
+        if msgid and (m.get("Message-ID") or "").strip() != msgid.strip():
+            continue
+        part = m.get_body(preferencelist=("plain", "html"))
+        if part is None:
+            return None
+        try:
+            t = part.get_content()
+        except Exception:
+            return None
+        if part.get_content_subtype() == "html":
+            t = html_text(t)
+        t = REPLY_MARK.split(t, maxsplit=1)[0]
+        t = "\n".join(l.rstrip() for l in t.splitlines() if not l.lstrip().startswith(">"))
+        t = re.split(r"(?m)^-- ?$", t, maxsplit=1)[0]
+        t = re.sub(r"\n{3,}", "\n\n", t).strip()
+        return t[:BODY_CAP] + (" […]" if len(t) > BODY_CAP else "")
+    return None
+
+
+def current_map(db):
+    return dict(db.execute(
+        "SELECT json_extract(spec,'$.key'), hash FROM current_artifacts "
+        "WHERE json_extract(spec,'$.type')=? ORDER BY created_at", (TYPE,)).fetchall())
+
+
+def put(cur, spec, text, stats):
+    prev = cur.get(spec["key"])
+    if prev == hashlib.sha256(text.encode()).hexdigest():
+        stats["unchanged"] += 1
+        return
+    p = subprocess.run([CE, "ingest", "--stdin", "--spec", json.dumps(spec, ensure_ascii=False)],
+                       input=text, capture_output=True, text=True)
+    if p.returncode != 0:
+        print(f"ce ingest failed for {spec['key']}: {p.stderr.strip()}", file=sys.stderr)
+        stats["failed"] += 1
+        return
+    new = json.loads(p.stdout.splitlines()[-1])["hash"]
+    if prev and prev != new:
+        subprocess.run([CE, "supersede", new, prev], check=True, capture_output=True)
+        stats["updated"] += 1
+    elif prev:
+        stats["unchanged"] += 1
+    else:
+        stats["new"] += 1
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--db", required=True)
+    ap.add_argument("--mailstore")
+    ap.add_argument("--me", action="append", default=[])
+    ap.add_argument("--contacts")
+    ap.add_argument("--keep", action="append", default=[])
+    ap.add_argument("--skip", action="append", default=[])
+    ap.add_argument("--mass", type=int, default=15)
+    ap.add_argument("--tz", default="Europe/Amsterdam")
+    ap.add_argument("--dry-run", action="store_true")
+    a = ap.parse_args()
+    tz = ZoneInfo(a.tz)
+    me = {x.lower() for x in a.me}
+    keep = [re.compile(r, re.I) for r in a.keep]
+    skip = [re.compile(r, re.I) for r in a.skip]
+    names = load_contacts(a.contacts)
+    src = sqlite3.connect(f"file:{os.path.abspath(a.db)}?mode=ro", uri=True)
+
+    addr = {r: (ad.strip().lower(), (cm or "").strip()) for r, ad, cm in
+            src.execute("SELECT rowid, address, comment FROM addresses")}
+    rcpt = {}
+    for msg, ad, typ in src.execute("SELECT message, address, type FROM recipients WHERE type IN (0,1)"):
+        rcpt.setdefault(msg, []).append(ad)
+
+    def label(rid):
+        ad, cm = addr.get(rid, ("?", ""))
+        n = names.get(ad) or cm
+        return f"{n} <{ad}>" if n and n.lower() != ad else ad
+
+    threads = {}
+    for row in src.execute(
+        "SELECT rowid, conversation_id, message_id_header, subject, sender, ts_sent, ts_received "
+        "FROM messages WHERE deleted = 0 ORDER BY COALESCE(ts_sent, ts_received), rowid"):
+        threads.setdefault(row[1], []).append(row)
+
+    stats = {"threads": 0, "kept": 0, "messages": 0, "bodies": 0,
+             "new": 0, "updated": 0, "unchanged": 0, "failed": 0}
+    kept = []
+    for conv, rows in threads.items():
+        stats["threads"] += 1
+        human = False
+        parts = set()
+        for rid, _, _, subj, snd, _, _ in rows:
+            sa = addr.get(snd, ("", ""))[0]
+            rc = rcpt.get(rid, [])
+            parts.add(sa)
+            parts.update(addr.get(x, ("", ""))[0] for x in rc)
+            if sa in me and len(rc) <= a.mass:
+                human = True
+            elif sa not in me and (sa in names or any(k.search(sa) for k in keep)):
+                human = True
+        subj0 = rows[0][3] or ""
+        if not human or any(s.search(x) for s in skip for x in [subj0, *parts]):
+            continue
+        kept.append((conv, rows))
+    stats["kept"] = len(kept)
+    if a.dry_run:
+        stats["messages"] = sum(len(r) for _, r in kept)
+        print(json.dumps(stats))
+        return
+
+    store = sqlite3.connect(f"file:{os.environ['CE_DB']}?mode=ro", uri=True)
+    store.execute("PRAGMA busy_timeout = 60000")
+    cur = current_map(store)
+    files = index_mailstore(a.mailstore)
+    for conv, rows in kept:
+        seen, lines, people = set(), [], {}
+        for rid, _, mid, subj, snd, ts, tr in rows:
+            k = mid or f"row{rid}"
+            if k in seen:
+                continue
+            seen.add(k)
+            stats["messages"] += 1
+            when = datetime.fromtimestamp(ts or tr or 0, tz)
+            frm = label(snd)
+            people.setdefault(frm, None)
+            to = [label(x) for x in rcpt.get(rid, [])]
+            for t in to:
+                people.setdefault(t, None)
+            body = body_of(files.get((mid or "").strip(), []), mid)
+            if body is not None:
+                stats["bodies"] += 1
+            head = f"## {when:%Y-%m-%d %H:%M} {frm}"
+            meta = f"to: {', '.join(to[:8])}{' +%d' % (len(to) - 8) if len(to) > 8 else ''}" if to else ""
+            lines.append("\n".join(x for x in [head, f"subject: {subj or ''}", meta,
+                                               "", body if body else "[body not available]"] if x is not None))
+        first = datetime.fromtimestamp(rows[0][5] or rows[0][6] or 0, tz)
+        last = datetime.fromtimestamp(rows[-1][5] or rows[-1][6] or 0, tz)
+        title = rows[0][3] or "(no subject)"
+        text = (f"# Mail: {title}\n{first:%Y-%m-%d} – {last:%Y-%m-%d}, {len(seen)} messages\n"
+                f"with: {', '.join(list(people)[:20])}\n\n" + "\n\n".join(lines) + "\n")
+        spec = {"type": TYPE, "repeatability": "volatile", "key": f"conv/{conv}",
+                "subject": title, "day": f"{first:%Y-%m-%d}", "last": f"{last:%Y-%m-%d}",
+                "db": os.path.abspath(a.db), "renderer": RENDERER}
+        put(cur, spec, text, stats)
+    print(json.dumps(stats))
+
+
+if __name__ == "__main__":
+    main()
