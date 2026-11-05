@@ -1,0 +1,120 @@
+#!/usr/bin/env python3
+"""Feed Apple Notes into a context engine.
+
+Reads the normalised database built by an Apple Notes export pipeline
+(tables `notes`, `folders`: identifier, title, body_text, creation_ts_utc,
+modification_ts_utc, marked_for_deletion, is_password_protected).
+
+  --db FILE           the notes database (opened read-only)
+  --skip-body REGEX   leave out notes whose title or body matches, e.g. notes
+                      holding passwords; repeatable. Skipped notes are counted,
+                      never stored.
+
+Each note becomes one source artifact keyed on its Notes identifier; its
+payload is the title, folder and dates, then the plain text. An edited note
+supersedes its previous version. Empty and password-protected notes are left
+out. Re-running with nothing new adds nothing.
+
+An adapter, not part of the store: it calls `ce` and reads the store only to
+find a note's current version. Python stdlib only.
+
+Usage:
+  ce-apple-notes [--skip-body REGEX ...] --db FILE
+"""
+
+import argparse
+import json
+import os
+import re
+import sqlite3
+import subprocess
+import sys
+from datetime import datetime, timezone
+
+CE = os.environ.get("CE", "ce")
+RENDERER = "ce-apple-notes/1"
+TYPE = "apple-note"
+
+
+def iso(ts):
+    return datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ") if ts else None
+
+
+def render(n):
+    head = [f"# {n['title'] or '(untitled)'}"]
+    if n["folder"]:
+        head.append(f"folder: {n['folder']}")
+    if n["created"]:
+        head.append(f"created: {n['created']}")
+    if n["modified"]:
+        head.append(f"modified: {n['modified']}")
+    if n["deleted"]:
+        head.append("marked for deletion in Notes")
+    return "\n".join(head) + "\n\n" + n["body"].strip() + "\n"
+
+
+def current(db, key):
+    row = db.execute(
+        "SELECT hash FROM current_artifacts WHERE json_extract(spec,'$.type')=? "
+        "AND json_extract(spec,'$.key')=? ORDER BY created_at DESC LIMIT 1",
+        (TYPE, key),
+    ).fetchone()
+    return row[0] if row else None
+
+
+def put(db, spec, text, stats):
+    prev = current(db, spec["key"])
+    p = subprocess.run(
+        [CE, "ingest", "--stdin", "--spec", json.dumps(spec, ensure_ascii=False)],
+        input=text, capture_output=True, text=True,
+    )
+    if p.returncode != 0:
+        print(f"ce ingest failed for {spec['key']}: {p.stderr.strip()}", file=sys.stderr)
+        stats["failed"] += 1
+        return
+    new = json.loads(p.stdout.splitlines()[-1])["hash"]
+    if prev == new:
+        stats["unchanged"] += 1
+    elif prev:
+        subprocess.run([CE, "supersede", new, prev], check=True, capture_output=True)
+        stats["updated"] += 1
+    else:
+        stats["new"] += 1
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--db", required=True, metavar="FILE")
+    ap.add_argument("--skip-body", action="append", default=[], metavar="REGEX")
+    a = ap.parse_args()
+    skip = [re.compile(r, re.I) for r in a.skip_body]
+    src = sqlite3.connect(f"file:{os.path.abspath(a.db)}?mode=ro", uri=True)
+    store = sqlite3.connect(f"file:{os.environ['CE_DB']}?mode=ro", uri=True)
+    store.execute("PRAGMA busy_timeout = 60000")
+
+    stats = {"new": 0, "updated": 0, "unchanged": 0, "skipped": 0, "empty": 0, "failed": 0}
+    rows = src.execute(
+        "SELECT n.identifier, n.title, n.body_text, n.creation_ts_utc, n.modification_ts_utc, "
+        "n.marked_for_deletion, n.is_password_protected, f.title "
+        "FROM notes n LEFT JOIN folders f ON f.pk = n.folder_pk ORDER BY n.creation_ts_utc"
+    )
+    for ident, title, body, cts, mts, deleted, locked, folder in rows:
+        if locked or not (body or "").strip() or not ident:
+            stats["empty"] += 1
+            continue
+        if any(r.search(title or "") or r.search(body) for r in skip):
+            stats["skipped"] += 1
+            continue
+        n = {"title": (title or "").strip(), "folder": folder, "body": body,
+             "created": iso(cts), "modified": iso(mts), "deleted": bool(deleted)}
+        spec = {"type": TYPE, "repeatability": "volatile", "key": ident,
+                "db": os.path.abspath(a.db), "renderer": RENDERER}
+        for k in ("title", "folder", "created", "modified"):
+            if n[k]:
+                spec[k] = n[k]
+        put(store, spec, render(n), stats)
+    print(json.dumps(stats))
+
+
+if __name__ == "__main__":
+    main()
