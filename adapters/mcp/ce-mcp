@@ -109,14 +109,20 @@ def ce(*args, stdin=None):
 
 
 def where(spec):
-    """Short human handle for an artifact: its path, or its spec type."""
+    """Short human handle for an artifact: its path, else type and title."""
     spec = spec or {}
-    return spec.get("path") or spec.get("type", "?")
+    if spec.get("path"):
+        return spec["path"]
+    t = spec.get("type", "?")
+    return f'{t} "{spec["title"]}"' if spec.get("title") else t
 
 
 def when(spec):
     spec = spec or {}
-    return (spec.get("committed_at") or "")[:10]
+    for k in ("committed_at", "modified", "created", "day"):
+        if spec.get(k):
+            return str(spec[k])[:10]
+    return ""
 
 
 def walk_line(r):
